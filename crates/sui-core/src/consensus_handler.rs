@@ -4141,7 +4141,6 @@ mod tests {
 
         let state = TestAuthorityBuilder::new()
             .with_starting_objects(&all_objects)
-            .skip_genesis_owner_index()
             .build()
             .await;
         let epoch_store = state.epoch_store_for_testing();
@@ -4263,7 +4262,6 @@ mod tests {
 
         let state = TestAuthorityBuilder::new()
             .with_starting_objects(&[gas_object.clone(), owned_object.clone()])
-            .skip_genesis_owner_index()
             .build()
             .await;
         let epoch_store = state.epoch_store_for_testing();
@@ -4316,7 +4314,6 @@ mod tests {
 
         let state = TestAuthorityBuilder::new()
             .with_starting_objects(&[gas_object.clone(), owned_object.clone()])
-            .skip_genesis_owner_index()
             .build()
             .await;
         let epoch_store = state.epoch_store_for_testing();
@@ -4386,7 +4383,6 @@ mod tests {
 
         let state = TestAuthorityBuilder::new()
             .with_starting_objects(&[gas_object.clone(), owned_object.clone()])
-            .skip_genesis_owner_index()
             .build()
             .await;
         let epoch_store = state.epoch_store_for_testing();
