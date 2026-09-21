@@ -31,9 +31,69 @@ answer: >-
   including syntax fundamentals, best practices, and package structure.
 ---
 
-Learn how to write Move smart contract packages for the Sui blockchain, including syntax fundamentals, best practices, and package structure.
+Move is the smart contract language of the Sui blockchain. You write Move code organized into packages, which are the deployable units on Sui. Each package contains one or more modules, and each module defines types, functions, and logic that run onchain.
 
-Learn how to write Move smart contract packages for Sui, including syntax fundamentals, best practices, and package structure.
+## What is a Move package?
+
+A Move package is a directory with a `Move.toml` manifest file and a `sources/` folder containing `.move` source files. The manifest declares the package name, version, and dependencies. The source files define the modules that make up the package.
+
+A minimal package structure looks like this:
+
+```
+my_package/
+├── Move.toml
+└── sources/
+    └── my_module.move
+```
+
+The `Move.toml` file identifies the package and lists its dependencies:
+
+```toml
+[package]
+name = "my_package"
+version = "0.0.1"
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
+
+[addresses]
+my_package = "0x0"
+```
+
+## What does a Move module look like?
+
+A Move module declares a module name, imports any dependencies, defines types, and implements functions. The following example defines a simple counter object:
+
+```move
+module my_package::counter {
+    use sui::object::{Self, UID};
+    use sui::transfer;
+    use sui::tx_context::{Self, TxContext};
+
+    public struct Counter has key {
+        id: UID,
+        value: u64,
+    }
+
+    public fun create(ctx: &mut TxContext) {
+        let counter = Counter {
+            id: object::new(ctx),
+            value: 0,
+        };
+        transfer::transfer(counter, tx_context::sender(ctx));
+    }
+
+    public fun increment(counter: &mut Counter) {
+        counter.value = counter.value + 1;
+    }
+}
+```
+
+This module defines a `Counter` type with the `key` ability, which makes it a Sui object. The `create` function constructs a new counter and transfers it to the transaction sender. The `increment` function updates the counter's value.
+
+## What topics does writing Move packages cover?
+
+The subtopics in this section cover everything you need to write production-ready Move packages on Sui, including object model basics, abilities and type system, package structure, testing, and upgrade patterns.
 
 import DocCardList from '@theme/DocCardList';
 
