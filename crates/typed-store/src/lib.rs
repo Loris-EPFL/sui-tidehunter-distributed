@@ -24,6 +24,26 @@ pub use rocks::init_write_sync;
 pub use typed_store_error::TypedStoreError;
 pub use util::be_fix_int_ser;
 
+/// TEST-ONLY handshake before opening an experimental distributed storage session.
+#[cfg(feature = "distributed-tidehunter-session")]
+pub fn validate_distributed_node_role(
+    runs_consensus: bool,
+    bounded_replay: bool,
+) -> std::io::Result<()> {
+    #[cfg(tidehunter)]
+    {
+        tidehunter::storage_integration::validate_node_role(runs_consensus, bounded_replay)
+    }
+    #[cfg(not(tidehunter))]
+    {
+        let _ = (runs_consensus, bounded_replay);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "distributed storage session requires USE_TIDEHUNTER and the distributed facade",
+        ))
+    }
+}
+
 pub type StoreError = typed_store_error::TypedStoreError;
 #[derive(Debug, PartialEq)]
 pub(crate) enum StorageType {

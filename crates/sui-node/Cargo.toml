@@ -73,6 +73,14 @@ sui-simulator.workspace = true
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
 testing = []
+distributed-tidehunter-session = ["typed-store/distributed-tidehunter-session"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# TEST-ONLY stopped-store audit uses the real RPC schema merge operators.
+sui-consistent-store.workspace = true
+sui-rpc-store.workspace = true
+
+[[example]]
+name = "distributed_storage_local_audit"
+required-features = ["testing"]

@@ -11,6 +11,12 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+testing = []
+distributed-tidehunter-bulk = []
+distributed-tidehunter-durability = ["testing"]
+distributed-tidehunter-session = ["testing"]
+
 [dependencies]
 anyhow.workspace = true
 backoff.workspace = true

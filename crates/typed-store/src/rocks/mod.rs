@@ -262,9 +262,9 @@ impl Database {
         }
     }
 
-    /// Multi-key variant of [`Self::contains`]. On tidehunter each key uses the
-    /// native `exists` presence check, avoiding the value-record reads that
-    /// `multi_get` performs. Other backends answer via `multi_get`.
+    /// Multi-key variant of [`Self::contains`]. Tidehunter presence checks avoid
+    /// value-record reads; the distributed feature groups them by owner. Other
+    /// backends answer via `multi_get`.
     fn multi_contains<I, K>(
         &self,
         cf: &ColumnFamily,
@@ -276,7 +276,18 @@ impl Database {
         K: AsRef<[u8]>,
     {
         match (&self.storage, cf) {
-            #[cfg(tidehunter)]
+            #[cfg(all(tidehunter, feature = "distributed-tidehunter-bulk"))]
+            (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => {
+                let keys: Vec<_> = keys
+                    .into_iter()
+                    .map(|k| transform_th_key(k.as_ref(), prefix))
+                    .collect();
+                db.multi_exists(*ks, &keys)
+                    .into_iter()
+                    .map(|item| item.map_err(typed_store_error_from_th_error))
+                    .collect()
+            }
+            #[cfg(all(tidehunter, not(feature = "distributed-tidehunter-bulk")))]
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => keys
                 .into_iter()
                 .map(|k| {
@@ -323,7 +334,21 @@ impl Database {
                 .into_iter()
                 .map(|r| Ok(r.map(GetResult::InMemory)))
                 .collect(),
-            #[cfg(tidehunter)]
+            #[cfg(all(tidehunter, feature = "distributed-tidehunter-bulk"))]
+            (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => {
+                let keys: Vec<_> = keys
+                    .into_iter()
+                    .map(|k| transform_th_key(k.as_ref(), prefix))
+                    .collect();
+                db.multi_get(*ks, &keys)
+                    .into_iter()
+                    .map(|item| {
+                        item.map_err(typed_store_error_from_th_error)
+                            .map(|item| item.map(|bytes| GetResult::TideHunter(bytes.into_owned())))
+                    })
+                    .collect()
+            }
+            #[cfg(all(tidehunter, not(feature = "distributed-tidehunter-bulk")))]
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => keys
                 .into_iter()
                 .map(|k| {

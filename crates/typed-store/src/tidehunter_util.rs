@@ -157,6 +157,12 @@ fn thdb_config(metric_conf: &MetricConf) -> Config {
         .enable_th_batch_compression
         .then_some(4 * 1024 * 1024 * 1024);
     let mut config = Config {
+        // TEST-ONLY: preserve matched native/facade acknowledgment guarantees.
+        #[cfg(feature = "distributed-tidehunter-durability")]
+        sync_writes: parse_env_bool("TH_SYNC_WRITES").unwrap_or(false),
+        #[cfg(feature = "distributed-tidehunter-durability")]
+        coalesce_wal_directory_sync: parse_env_bool("TH_COALESCE_WAL_DIRECTORY_SYNC")
+            .unwrap_or(false),
         frag_size,
         // run snapshot every 8 Gb written to wal
         snapshot_written_bytes: parse_env_usize("TH_SNAPSHOT_WRITTEN_BYTES", 1)

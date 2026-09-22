@@ -500,6 +500,11 @@ impl SuiNode {
         let run_with_range = config.run_with_range;
         let prometheus_registry = registry_service.default_registry();
         let node_role = config.intended_node_role();
+        #[cfg(feature = "distributed-tidehunter-session")]
+        typed_store::validate_distributed_node_role(
+            node_role.runs_consensus(),
+            run_with_range.is_some(),
+        )?;
 
         info!(node =? config.protocol_public_key(),
             "Initializing sui-node listening on {} with role {:?}", config.network_address, node_role
@@ -664,6 +669,12 @@ impl SuiNode {
         )?;
 
         info!("created epoch store");
+
+        #[cfg(feature = "distributed-tidehunter-session")]
+        typed_store::validate_distributed_node_role(
+            epoch_store.node_role().runs_consensus(),
+            run_with_range.is_some(),
+        )?;
 
         replay_log!(
             "Beginning replay run. Epoch: {:?}, Protocol config: {:?}",
@@ -2099,6 +2110,12 @@ impl SuiNode {
             ));
 
             let next_epoch_committee = new_epoch_start_state.get_sui_committee();
+            #[cfg(feature = "distributed-tidehunter-session")]
+            self.validate_distributed_epoch_role(NodeRole::from_committee(
+                &next_epoch_committee,
+                &self.config.protocol_public_key(),
+                self.config.fullnode_sync_mode,
+            ))?;
             let next_epoch = next_epoch_committee.epoch();
             assert_eq!(cur_epoch_store.epoch() + 1, next_epoch);
 
@@ -2134,6 +2151,8 @@ impl SuiNode {
                 .await;
 
             let new_role = new_epoch_store.node_role();
+            #[cfg(feature = "distributed-tidehunter-session")]
+            self.validate_distributed_epoch_role(new_role)?;
             if !new_role.is_validator()
                 && let Some(context) = &self.transaction_pool_context
             {
@@ -2298,6 +2317,22 @@ impl SuiNode {
             epoch_store = new_epoch_store;
             info!("Reconfiguration finished");
         }
+    }
+
+    #[cfg(feature = "distributed-tidehunter-session")]
+    fn validate_distributed_epoch_role(&self, role: NodeRole) -> Result<()> {
+        if let Err(error) = typed_store::validate_distributed_node_role(
+            role.runs_consensus(),
+            self.config.run_with_range.is_some(),
+        ) {
+            // The reconfiguration task only logs returned errors. Notify the
+            // owner to stop all services after the facade rejects the session.
+            self.shutdown_channel_tx.send(None).map_err(|_| {
+                anyhow::anyhow!("storage session rejected and no shutdown subscriber: {error}")
+            })?;
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     async fn shutdown(&self) {
