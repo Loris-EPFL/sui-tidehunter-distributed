@@ -763,6 +763,16 @@ impl<K, V> DBMap<K, V> {
         &self.cf
     }
 
+    /// Preserve the distributed backend's local recovery checks on control-cache hits.
+    pub fn validate_cached_read(&self) -> Result<(), TypedStoreError> {
+        #[cfg(tidehunter)]
+        if let Storage::TideHunter(db) = &self.db.storage {
+            db.validate_cached_read()
+                .map_err(crate::tidehunter_util::typed_store_error_from_th_error)?;
+        }
+        Ok(())
+    }
+
     pub fn batch(&self) -> DBBatch {
         let batch = match &self.db.storage {
             Storage::Rocks(_) => StorageWriteBatch::Rocks(WriteBatch::default()),

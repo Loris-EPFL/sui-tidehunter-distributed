@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::authority_store_tables::AuthorityPerpetualTables;
-use crate::checkpoints::{CheckpointStore, CheckpointWatermark};
+use crate::checkpoints::CheckpointStore;
 use crate::jsonrpc_index::IndexStore;
 use anyhow::anyhow;
 use mysten_metrics::monitored_scope;
@@ -346,34 +346,16 @@ impl AuthorityStorePruner {
         )?;
         perpetual_batch.delete_batch(&perpetual_db.effects, effect_digests)?;
 
-        let mut checkpoints_batch = checkpoint_db.tables.certified_checkpoints.batch();
-
-        let checkpoint_content_digests =
-            checkpoint_content_to_prune.iter().map(|ckpt| ckpt.digest());
-        checkpoints_batch.delete_batch(
-            &checkpoint_db.tables.checkpoint_content,
-            checkpoint_content_digests.clone(),
-        )?;
-        checkpoints_batch.delete_batch(
-            &checkpoint_db.tables.checkpoint_sequence_by_contents_digest,
+        let checkpoint_content_digests = checkpoint_content_to_prune
+            .iter()
+            .map(|checkpoint| *checkpoint.digest())
+            .collect();
+        perpetual_batch.write()?;
+        checkpoint_db.prune_checkpoint_data(
+            checkpoint_number,
+            checkpoints_to_prune,
             checkpoint_content_digests,
         )?;
-
-        checkpoints_batch.delete_batch(
-            &checkpoint_db.tables.checkpoint_by_digest,
-            checkpoints_to_prune,
-        )?;
-
-        checkpoints_batch.insert_batch(
-            &checkpoint_db.tables.watermarks,
-            [(
-                &CheckpointWatermark::HighestPruned,
-                &(checkpoint_number, CheckpointDigest::random()),
-            )],
-        )?;
-
-        perpetual_batch.write()?;
-        checkpoints_batch.write()?;
         metrics
             .last_pruned_effects_checkpoint
             .set(checkpoint_number as i64);
@@ -803,9 +785,7 @@ impl AuthorityStorePruner {
             return Ok(false);
         }
         info!("relocation: setting epoch watermark to {}", new_watermark);
-        pruning_watermark
-            .epoch_id
-            .store(new_watermark, Ordering::Relaxed);
+        checkpoint_store.update_pruning_epoch(pruning_watermark, new_watermark);
         if let Some(checkpoint_id) = checkpoint_id {
             let watermark = if objects_compactor_active {
                 checkpoint_id
@@ -840,7 +820,11 @@ impl AuthorityStorePruner {
             return Ok(());
         }
         perpetual_db.objects.db.start_relocation()?;
-        checkpoint_store.tables.watermarks.db.start_relocation()?;
+        checkpoint_store
+            .tables
+            .certified_checkpoints
+            .db
+            .start_relocation()?;
         Self::prune_executed_tx_digests_th(perpetual_db, checkpoint_store)?;
         Ok(())
     }

@@ -4,6 +4,7 @@
 pub(crate) mod causal_order;
 pub mod checkpoint_executor;
 mod checkpoint_output;
+mod control_cache;
 mod metrics;
 
 use crate::accumulators::{self, AccumulatorSettlementTxBuilder};
@@ -193,7 +194,7 @@ pub struct CheckpointStoreTables {
     /// Stores certified checkpoints
     pub(crate) certified_checkpoints: DBMap<CheckpointSequenceNumber, TrustedCheckpoint>,
     /// Map from checkpoint digest to certified checkpoint
-    pub(crate) checkpoint_by_digest: DBMap<CheckpointDigest, TrustedCheckpoint>,
+    checkpoint_by_digest: DBMap<CheckpointDigest, TrustedCheckpoint>,
 
     /// Store locally computed checkpoint summaries so that we can detect forks and log useful
     /// information. Can be pruned as soon as we verify that we are in agreement with the latest
@@ -205,7 +206,7 @@ pub struct CheckpointStoreTables {
 
     /// Watermarks used to determine the highest verified, fully synced, and
     /// fully executed checkpoints
-    pub(crate) watermarks: DBMap<CheckpointWatermark, (CheckpointSequenceNumber, CheckpointDigest)>,
+    watermarks: DBMap<CheckpointWatermark, (CheckpointSequenceNumber, CheckpointDigest)>,
 
     /// Stores transaction fork detection information, including the certified checkpoint (if
     /// any) that supplied the expected effects digest and the binary version that forked.
@@ -377,6 +378,10 @@ impl CheckpointStoreTables {
 
 pub struct CheckpointStore {
     pub(crate) tables: CheckpointStoreTables,
+    // The live node shares one CheckpointStore. This lock orders durable mutations,
+    // cache fills and publication; keeping it through the write also orders resets.
+    control_cache: Mutex<control_cache::ControlCache>,
+    pruner_watermarks: Arc<PrunerWatermarks>,
     synced_checkpoint_notify_read: NotifyRead<CheckpointSequenceNumber, VerifiedCheckpoint>,
     executed_checkpoint_notify_read: NotifyRead<CheckpointSequenceNumber, VerifiedCheckpoint>,
     /// The running binary's version, set once at node startup. Embedded in fork markers so
@@ -386,13 +391,8 @@ pub struct CheckpointStore {
 
 impl CheckpointStore {
     pub fn new(path: &Path, pruner_watermarks: Arc<PrunerWatermarks>) -> Arc<Self> {
-        let tables = CheckpointStoreTables::new(path, "checkpoint", pruner_watermarks);
-        Arc::new(Self {
-            tables,
-            synced_checkpoint_notify_read: NotifyRead::new(),
-            executed_checkpoint_notify_read: NotifyRead::new(),
-            binary_version: OnceLock::new(),
-        })
+        let tables = CheckpointStoreTables::new(path, "checkpoint", pruner_watermarks.clone());
+        Self::from_tables(tables, pruner_watermarks)
     }
 
     pub fn new_for_tests() -> Arc<Self> {
@@ -401,17 +401,44 @@ impl CheckpointStore {
     }
 
     pub fn new_for_db_checkpoint_handler(path: &Path) -> Arc<Self> {
-        let tables = CheckpointStoreTables::new(
-            path,
-            "db_checkpoint",
-            Arc::new(PrunerWatermarks::default()),
-        );
-        Arc::new(Self {
+        let pruner_watermarks = Arc::new(PrunerWatermarks::default());
+        let tables = CheckpointStoreTables::new(path, "db_checkpoint", pruner_watermarks.clone());
+        Self::from_tables(tables, pruner_watermarks)
+    }
+
+    fn from_tables(
+        tables: CheckpointStoreTables,
+        pruner_watermarks: Arc<PrunerWatermarks>,
+    ) -> Arc<Self> {
+        let mut cache = control_cache::ControlCache::default();
+        for watermark in [
+            CheckpointWatermark::HighestVerified,
+            CheckpointWatermark::HighestSynced,
+            CheckpointWatermark::HighestExecuted,
+            CheckpointWatermark::HighestPruned,
+        ] {
+            cache
+                .read(watermark, || tables.watermarks.get(&watermark))
+                .expect("loading durable checkpoint watermark");
+        }
+        let store = Arc::new(Self {
             tables,
+            control_cache: Mutex::new(cache),
+            pruner_watermarks,
             synced_checkpoint_notify_read: NotifyRead::new(),
             executed_checkpoint_notify_read: NotifyRead::new(),
             binary_version: OnceLock::new(),
-        })
+        });
+        for watermark in [
+            CheckpointWatermark::HighestVerified,
+            CheckpointWatermark::HighestSynced,
+            CheckpointWatermark::HighestExecuted,
+        ] {
+            store
+                .highest_checkpoint(watermark)
+                .expect("loading durable checkpoint watermark summary");
+        }
+        store
     }
 
     pub fn set_binary_version(&self, version: &str) {
@@ -474,10 +501,115 @@ impl CheckpointStore {
         &self,
         digest: &CheckpointDigest,
     ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
-        self.tables
+        let mut cache = self.control_cache.lock();
+        self.cached_checkpoint_by_digest(&mut cache, digest)
+    }
+
+    fn validate_control_cache_read(&self) -> Result<(), TypedStoreError> {
+        self.tables.watermarks.validate_cached_read()?;
+        Ok(())
+    }
+
+    fn cached_watermark(
+        &self,
+        cache: &mut control_cache::ControlCache,
+        watermark: CheckpointWatermark,
+    ) -> Result<Option<control_cache::StoredWatermark>, TypedStoreError> {
+        self.validate_control_cache_read()?;
+        cache.read(watermark, || self.tables.watermarks.get(&watermark))
+    }
+
+    fn cached_checkpoint_by_digest(
+        &self,
+        cache: &mut control_cache::ControlCache,
+        digest: &CheckpointDigest,
+    ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
+        self.validate_control_cache_read()?;
+        self.invalidate_relocated_summaries(cache);
+        if let Some(checkpoint) = cache.summaries.get(digest) {
+            return Ok(Some(checkpoint.clone()));
+        }
+        let checkpoint = self
+            .tables
             .checkpoint_by_digest
-            .get(digest)
-            .map(|maybe_checkpoint| maybe_checkpoint.map(|c| c.into()))
+            .get(digest)?
+            .map(Into::into);
+        if let Some(checkpoint) = &checkpoint {
+            self.cache_certified_summary(cache, checkpoint);
+        }
+        Ok(checkpoint)
+    }
+
+    fn invalidate_relocated_summaries(&self, cache: &mut control_cache::ControlCache) {
+        #[cfg(tidehunter)]
+        {
+            let epoch = self
+                .pruner_watermarks
+                .epoch_id
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let expired: Vec<_> = cache
+                .summaries
+                .iter()
+                .filter(|(_, checkpoint)| checkpoint.epoch() < epoch)
+                .map(|(digest, _)| *digest)
+                .collect();
+            for digest in expired {
+                cache.summaries.pop(&digest);
+            }
+        }
+        #[cfg(not(tidehunter))]
+        let _ = cache;
+    }
+
+    #[cfg(tidehunter)]
+    pub(crate) fn update_pruning_epoch(&self, watermarks: &PrunerWatermarks, epoch: EpochId) {
+        let mut cache = self.control_cache.lock();
+        // Order eligibility publication with cache readers before relocation can
+        // remove durable summaries. Eligible rows are never cached again.
+        watermarks
+            .epoch_id
+            .store(epoch, std::sync::atomic::Ordering::Release);
+        cache.summaries.clear();
+    }
+
+    fn cache_certified_summary(
+        &self,
+        cache: &mut control_cache::ControlCache,
+        checkpoint: &VerifiedCheckpoint,
+    ) {
+        #[cfg(tidehunter)]
+        if checkpoint.epoch()
+            < self
+                .pruner_watermarks
+                .epoch_id
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        cache
+            .summaries
+            .put(*checkpoint.digest(), checkpoint.clone());
+    }
+
+    fn highest_checkpoint(
+        &self,
+        watermark: CheckpointWatermark,
+    ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
+        let mut cache = self.control_cache.lock();
+        match self.cached_watermark(&mut cache, watermark)? {
+            Some((_, digest)) => self.cached_checkpoint_by_digest(&mut cache, &digest),
+            None => Ok(None),
+        }
+    }
+
+    fn highest_checkpoint_sequence(
+        &self,
+        watermark: CheckpointWatermark,
+    ) -> Result<Option<CheckpointSequenceNumber>, TypedStoreError> {
+        let mut cache = self.control_cache.lock();
+        Ok(self
+            .cached_watermark(&mut cache, watermark)?
+            .map(|(seq, _)| seq))
     }
 
     pub fn get_checkpoint_by_sequence_number(
@@ -578,83 +710,37 @@ impl CheckpointStore {
     pub fn get_highest_verified_checkpoint(
         &self,
     ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
-        let highest_verified = if let Some(highest_verified) = self
-            .tables
-            .watermarks
-            .get(&CheckpointWatermark::HighestVerified)?
-        {
-            highest_verified
-        } else {
-            return Ok(None);
-        };
-        self.get_checkpoint_by_digest(&highest_verified.1)
+        self.highest_checkpoint(CheckpointWatermark::HighestVerified)
     }
 
     pub fn get_highest_synced_checkpoint(
         &self,
     ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
-        let highest_synced = if let Some(highest_synced) = self
-            .tables
-            .watermarks
-            .get(&CheckpointWatermark::HighestSynced)?
-        {
-            highest_synced
-        } else {
-            return Ok(None);
-        };
-        self.get_checkpoint_by_digest(&highest_synced.1)
+        self.highest_checkpoint(CheckpointWatermark::HighestSynced)
     }
 
     pub fn get_highest_synced_checkpoint_seq_number(
         &self,
     ) -> Result<Option<CheckpointSequenceNumber>, TypedStoreError> {
-        if let Some(highest_synced) = self
-            .tables
-            .watermarks
-            .get(&CheckpointWatermark::HighestSynced)?
-        {
-            Ok(Some(highest_synced.0))
-        } else {
-            Ok(None)
-        }
+        self.highest_checkpoint_sequence(CheckpointWatermark::HighestSynced)
     }
 
     pub fn get_highest_executed_checkpoint_seq_number(
         &self,
     ) -> Result<Option<CheckpointSequenceNumber>, TypedStoreError> {
-        if let Some(highest_executed) = self
-            .tables
-            .watermarks
-            .get(&CheckpointWatermark::HighestExecuted)?
-        {
-            Ok(Some(highest_executed.0))
-        } else {
-            Ok(None)
-        }
+        self.highest_checkpoint_sequence(CheckpointWatermark::HighestExecuted)
     }
 
     pub fn get_highest_executed_checkpoint(
         &self,
     ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
-        let highest_executed = if let Some(highest_executed) = self
-            .tables
-            .watermarks
-            .get(&CheckpointWatermark::HighestExecuted)?
-        {
-            highest_executed
-        } else {
-            return Ok(None);
-        };
-        self.get_checkpoint_by_digest(&highest_executed.1)
+        self.highest_checkpoint(CheckpointWatermark::HighestExecuted)
     }
 
     pub fn get_highest_pruned_checkpoint_seq_number(
         &self,
     ) -> Result<Option<CheckpointSequenceNumber>, TypedStoreError> {
-        self.tables
-            .watermarks
-            .get(&CheckpointWatermark::HighestPruned)
-            .map(|watermark| watermark.map(|w| w.0))
+        self.highest_checkpoint_sequence(CheckpointWatermark::HighestPruned)
     }
 
     pub fn get_checkpoint_contents(
@@ -828,6 +914,7 @@ impl CheckpointStore {
             checkpoint_seq = checkpoint.sequence_number(),
             "Inserting certified checkpoint",
         );
+        let mut cache = self.control_cache.lock();
         let mut batch = self.tables.certified_checkpoints.batch();
         batch
             .insert_batch(
@@ -844,7 +931,12 @@ impl CheckpointStore {
                 [(&checkpoint.epoch(), checkpoint.sequence_number())],
             )?;
         }
-        batch.write()?;
+        if let Err(error) = batch.write() {
+            cache.summaries.clear();
+            return Err(error);
+        }
+        self.cache_certified_summary(&mut cache, checkpoint);
+        drop(cache);
 
         if let Some(local_checkpoint) = self
             .tables
@@ -872,19 +964,20 @@ impl CheckpointStore {
         &self,
         checkpoint: &VerifiedCheckpoint,
     ) -> Result<(), TypedStoreError> {
-        if Some(*checkpoint.sequence_number())
-            > self
-                .get_highest_verified_checkpoint()?
-                .map(|x| *x.sequence_number())
-        {
+        let mut cache = self.control_cache.lock();
+        let previous =
+            match self.cached_watermark(&mut cache, CheckpointWatermark::HighestVerified)? {
+                Some((_, digest)) => self
+                    .cached_checkpoint_by_digest(&mut cache, &digest)?
+                    .map(|checkpoint| *checkpoint.sequence_number()),
+                None => None,
+            };
+        if Some(*checkpoint.sequence_number()) > previous {
             debug!(
                 checkpoint_seq = checkpoint.sequence_number(),
                 "Updating highest verified checkpoint",
             );
-            self.tables.watermarks.insert(
-                &CheckpointWatermark::HighestVerified,
-                &(*checkpoint.sequence_number(), *checkpoint.digest()),
-            )?;
+            self.persist_watermark(&mut cache, CheckpointWatermark::HighestVerified, checkpoint)?;
         }
 
         Ok(())
@@ -896,22 +989,24 @@ impl CheckpointStore {
     ) -> Result<(), TypedStoreError> {
         let seq = *checkpoint.sequence_number();
         debug!(checkpoint_seq = seq, "Updating highest synced checkpoint",);
-        self.tables.watermarks.insert(
-            &CheckpointWatermark::HighestSynced,
-            &(seq, *checkpoint.digest()),
-        )?;
+        {
+            let mut cache = self.control_cache.lock();
+            self.persist_watermark(&mut cache, CheckpointWatermark::HighestSynced, checkpoint)?;
+        }
         self.synced_checkpoint_notify_read.notify(&seq, checkpoint);
         Ok(())
     }
 
-    async fn notify_read_checkpoint_watermark<F>(
+    async fn notify_read_checkpoint_watermark<F, G>(
         &self,
         notify_read: &NotifyRead<CheckpointSequenceNumber, VerifiedCheckpoint>,
         seq: CheckpointSequenceNumber,
         get_watermark: F,
+        get_highest_checkpoint: G,
     ) -> VerifiedCheckpoint
     where
         F: Fn() -> Option<CheckpointSequenceNumber>,
+        G: Fn() -> Option<VerifiedCheckpoint>,
     {
         notify_read
             .read("notify_read_checkpoint_watermark", &[seq], |seqs| {
@@ -921,6 +1016,15 @@ impl CheckpointStore {
                 };
                 if highest < seq {
                     return vec![None];
+                }
+                if highest == seq {
+                    if let Some(checkpoint) = get_highest_checkpoint() {
+                        // A concurrent reset may have changed the watermark since
+                        // the first read; only use a summary for the requested row.
+                        if *checkpoint.sequence_number() == seq {
+                            return vec![Some(checkpoint)];
+                        }
+                    }
                 }
                 let checkpoint = self
                     .get_checkpoint_by_sequence_number(seq)
@@ -938,10 +1042,15 @@ impl CheckpointStore {
         &self,
         seq: CheckpointSequenceNumber,
     ) -> VerifiedCheckpoint {
-        self.notify_read_checkpoint_watermark(&self.synced_checkpoint_notify_read, seq, || {
-            self.get_highest_synced_checkpoint_seq_number()
-                .expect("db error")
-        })
+        self.notify_read_checkpoint_watermark(
+            &self.synced_checkpoint_notify_read,
+            seq,
+            || {
+                self.get_highest_synced_checkpoint_seq_number()
+                    .expect("db error")
+            },
+            || self.get_highest_synced_checkpoint().expect("db error"),
+        )
         .await
     }
 
@@ -949,10 +1058,15 @@ impl CheckpointStore {
         &self,
         seq: CheckpointSequenceNumber,
     ) -> VerifiedCheckpoint {
-        self.notify_read_checkpoint_watermark(&self.executed_checkpoint_notify_read, seq, || {
-            self.get_highest_executed_checkpoint_seq_number()
-                .expect("db error")
-        })
+        self.notify_read_checkpoint_watermark(
+            &self.executed_checkpoint_notify_read,
+            seq,
+            || {
+                self.get_highest_executed_checkpoint_seq_number()
+                    .expect("db error")
+            },
+            || self.get_highest_executed_checkpoint().expect("db error"),
+        )
         .await
     }
 
@@ -960,7 +1074,10 @@ impl CheckpointStore {
         &self,
         checkpoint: &VerifiedCheckpoint,
     ) -> Result<(), TypedStoreError> {
-        if let Some(seq_number) = self.get_highest_executed_checkpoint_seq_number()? {
+        let mut cache = self.control_cache.lock();
+        if let Some((seq_number, _)) =
+            self.cached_watermark(&mut cache, CheckpointWatermark::HighestExecuted)?
+        {
             if seq_number >= *checkpoint.sequence_number() {
                 return Ok(());
             }
@@ -974,10 +1091,8 @@ impl CheckpointStore {
         }
         let seq = *checkpoint.sequence_number();
         debug!(checkpoint_seq = seq, "Updating highest executed checkpoint",);
-        self.tables.watermarks.insert(
-            &CheckpointWatermark::HighestExecuted,
-            &(seq, *checkpoint.digest()),
-        )?;
+        self.persist_watermark(&mut cache, CheckpointWatermark::HighestExecuted, checkpoint)?;
+        drop(cache);
         self.executed_checkpoint_notify_read
             .notify(&seq, checkpoint);
         Ok(())
@@ -987,10 +1102,8 @@ impl CheckpointStore {
         &self,
         checkpoint: &VerifiedCheckpoint,
     ) -> Result<(), TypedStoreError> {
-        self.tables.watermarks.insert(
-            &CheckpointWatermark::HighestPruned,
-            &(*checkpoint.sequence_number(), *checkpoint.digest()),
-        )
+        let mut cache = self.control_cache.lock();
+        self.persist_watermark(&mut cache, CheckpointWatermark::HighestPruned, checkpoint)
     }
 
     /// Sets highest executed checkpoint to any value.
@@ -1001,10 +1114,50 @@ impl CheckpointStore {
         &self,
         checkpoint: &VerifiedCheckpoint,
     ) -> Result<(), TypedStoreError> {
-        self.tables.watermarks.insert(
-            &CheckpointWatermark::HighestExecuted,
-            &(*checkpoint.sequence_number(), *checkpoint.digest()),
-        )
+        let mut cache = self.control_cache.lock();
+        self.persist_watermark(&mut cache, CheckpointWatermark::HighestExecuted, checkpoint)
+    }
+
+    fn persist_watermark(
+        &self,
+        cache: &mut control_cache::ControlCache,
+        watermark: CheckpointWatermark,
+        checkpoint: &VerifiedCheckpoint,
+    ) -> Result<(), TypedStoreError> {
+        let value = (*checkpoint.sequence_number(), *checkpoint.digest());
+        cache.persist(watermark, Some(value), || {
+            self.tables.watermarks.insert(&watermark, &value)
+        })
+    }
+
+    /// Keeps pruning's digest deletions and pruned-watermark publication in one
+    /// durable batch while preventing cached summaries from surviving deletion.
+    pub(crate) fn prune_checkpoint_data(
+        &self,
+        checkpoint_number: CheckpointSequenceNumber,
+        checkpoints: Vec<CheckpointDigest>,
+        contents: Vec<CheckpointContentsDigest>,
+    ) -> Result<(), TypedStoreError> {
+        let mut cache = self.control_cache.lock();
+        let mut batch = self.tables.certified_checkpoints.batch();
+        batch.delete_batch(&self.tables.checkpoint_content, &contents)?;
+        batch.delete_batch(
+            &self.tables.checkpoint_sequence_by_contents_digest,
+            &contents,
+        )?;
+        batch.delete_batch(&self.tables.checkpoint_by_digest, &checkpoints)?;
+        let value = (checkpoint_number, CheckpointDigest::random());
+        batch.insert_batch(
+            &self.tables.watermarks,
+            [(CheckpointWatermark::HighestPruned, value)],
+        )?;
+        cache.persist(CheckpointWatermark::HighestPruned, Some(value), || {
+            batch.write()
+        })?;
+        for digest in checkpoints {
+            cache.summaries.pop(&digest);
+        }
+        Ok(())
     }
 
     pub fn insert_checkpoint_contents(
@@ -1236,12 +1389,13 @@ impl CheckpointStore {
     }
 
     pub fn delete_highest_executed_checkpoint_test_only(&self) -> Result<(), TypedStoreError> {
+        let mut cache = self.control_cache.lock();
         let mut wb = self.tables.watermarks.batch();
         wb.delete_batch(
             &self.tables.watermarks,
             std::iter::once(CheckpointWatermark::HighestExecuted),
         )?;
-        wb.write()?;
+        cache.persist(CheckpointWatermark::HighestExecuted, None, || wb.write())?;
         Ok(())
     }
 
@@ -3237,11 +3391,288 @@ mod tests {
     use sui_protocol_config::{Chain, ProtocolConfig};
     use sui_types::accumulator_event::AccumulatorEvent;
     use sui_types::base_types::{SequenceNumber, TransactionEffectsDigest};
-    use sui_types::crypto::Signature;
+    use sui_types::crypto::{KeypairTraits, Signature};
     use sui_types::effects::{TransactionEffects, TransactionEvents};
     use sui_types::messages_checkpoint::SignedCheckpointSummary;
     use sui_types::transaction::VerifiedTransaction;
     use tokio::sync::mpsc;
+
+    fn control_cache_store() -> (tempfile::TempDir, Arc<CheckpointStore>) {
+        // Synchronous TideHunter writes sync the containing directory as well;
+        // keep the directory alive until the store has finished using it.
+        let directory = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(directory.path(), Arc::new(PrunerWatermarks::default()));
+        (directory, store)
+    }
+
+    fn control_cache_checkpoint(sequence: u64) -> VerifiedCheckpoint {
+        let (committee, keys) =
+            sui_types::committee::Committee::new_simple_test_committee_of_size(1);
+        let contents = CheckpointContents::new_with_digests_only_for_tests([
+            sui_types::base_types::ExecutionDigests::random(),
+        ]);
+        let summary = CheckpointSummary::new(
+            &ProtocolConfig::get_for_max_version_UNSAFE(),
+            committee.epoch,
+            sequence,
+            1,
+            &contents,
+            None,
+            GasCostSummary::default(),
+            None,
+            0,
+            Vec::new(),
+            Vec::new(),
+        );
+        let signed = SignedCheckpointSummary::new(
+            committee.epoch,
+            summary.clone(),
+            &keys[0],
+            keys[0].public().into(),
+        );
+        VerifiedCheckpoint::new_unchecked(
+            CertifiedCheckpointSummary::new(summary, vec![signed.into_sig()], &committee).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_control_cache_mutations_and_reset() {
+        let (_directory, store) = control_cache_store();
+        assert_eq!(
+            store.get_highest_executed_checkpoint_seq_number().unwrap(),
+            None
+        );
+        let first = control_cache_checkpoint(0);
+        let second = control_cache_checkpoint(1);
+        store.insert_verified_checkpoint(&first).unwrap();
+        store.insert_verified_checkpoint(&second).unwrap();
+        store.update_highest_verified_checkpoint(&first).unwrap();
+        assert_eq!(
+            store
+                .get_highest_verified_checkpoint()
+                .unwrap()
+                .unwrap()
+                .digest(),
+            second.digest()
+        );
+        store.update_highest_synced_checkpoint(&second).unwrap();
+        store.update_highest_executed_checkpoint(&first).unwrap();
+        store.update_highest_executed_checkpoint(&second).unwrap();
+        assert_eq!(
+            store.notify_read_executed_checkpoint(1).await.digest(),
+            second.digest()
+        );
+        assert_eq!(
+            store.notify_read_synced_checkpoint(1).await.digest(),
+            second.digest()
+        );
+        store
+            .set_highest_executed_checkpoint_subtle(&first)
+            .unwrap();
+        store.update_highest_synced_checkpoint(&first).unwrap();
+        assert_eq!(
+            store.get_highest_executed_checkpoint_seq_number().unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            store.get_highest_synced_checkpoint_seq_number().unwrap(),
+            Some(0)
+        );
+        store.reset_db_for_execution_since_genesis().unwrap();
+        assert!(store.get_highest_executed_checkpoint().unwrap().is_none());
+        store.update_highest_executed_checkpoint(&first).unwrap();
+        assert_eq!(
+            store
+                .get_highest_executed_checkpoint()
+                .unwrap()
+                .unwrap()
+                .digest(),
+            first.digest()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_control_cache_recovery_both_constructors() {
+        for checkpoint_handler in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let checkpoint = control_cache_checkpoint(9);
+            {
+                let store =
+                    CheckpointStore::new(directory.path(), Arc::new(PrunerWatermarks::default()));
+                store.insert_verified_checkpoint(&checkpoint).unwrap();
+                store.update_highest_synced_checkpoint(&checkpoint).unwrap();
+                store
+                    .set_highest_executed_checkpoint_subtle(&checkpoint)
+                    .unwrap();
+                store.update_highest_pruned_checkpoint(&checkpoint).unwrap();
+            }
+            let reopened = if checkpoint_handler {
+                CheckpointStore::new_for_db_checkpoint_handler(directory.path())
+            } else {
+                CheckpointStore::new(directory.path(), Arc::new(PrunerWatermarks::default()))
+            };
+            assert!(
+                reopened
+                    .control_cache
+                    .lock()
+                    .summaries
+                    .contains(checkpoint.digest())
+            );
+            assert_eq!(
+                reopened
+                    .get_highest_verified_checkpoint()
+                    .unwrap()
+                    .unwrap()
+                    .digest(),
+                checkpoint.digest()
+            );
+            assert_eq!(
+                reopened
+                    .get_highest_synced_checkpoint()
+                    .unwrap()
+                    .unwrap()
+                    .digest(),
+                checkpoint.digest()
+            );
+            assert_eq!(
+                reopened
+                    .get_highest_executed_checkpoint()
+                    .unwrap()
+                    .unwrap()
+                    .digest(),
+                checkpoint.digest()
+            );
+            assert_eq!(
+                reopened.get_highest_pruned_checkpoint_seq_number().unwrap(),
+                Some(9)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_control_cache_pruning_and_missing_summary() {
+        let (_directory, store) = control_cache_store();
+        let checkpoint = control_cache_checkpoint(7);
+        store
+            .set_highest_executed_checkpoint_subtle(&checkpoint)
+            .unwrap();
+        assert!(store.get_highest_executed_checkpoint().unwrap().is_none());
+        store.insert_certified_checkpoint(&checkpoint).unwrap();
+        assert_eq!(
+            store
+                .get_highest_executed_checkpoint()
+                .unwrap()
+                .unwrap()
+                .digest(),
+            checkpoint.digest()
+        );
+        store
+            .prune_checkpoint_data(7, vec![*checkpoint.digest()], vec![])
+            .unwrap();
+        assert!(
+            store
+                .get_checkpoint_by_digest(checkpoint.digest())
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get_highest_executed_checkpoint().unwrap().is_none());
+        assert_eq!(
+            store.get_highest_pruned_checkpoint_seq_number().unwrap(),
+            Some(7)
+        );
+        assert!(
+            store
+                .get_checkpoint_by_sequence_number(7)
+                .unwrap()
+                .is_some()
+        );
+        let notified = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.notify_read_executed_checkpoint(7),
+        )
+        .await
+        .expect("notification must retain the certified-sequence fallback after digest pruning");
+        assert_eq!(notified.digest(), checkpoint.digest());
+        for sequence in 8..24 {
+            store
+                .insert_certified_checkpoint(&control_cache_checkpoint(sequence))
+                .unwrap();
+        }
+        assert_eq!(store.control_cache.lock().summaries.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_control_cache_concurrent_verified_updates() {
+        let (_directory, store) = control_cache_store();
+        let checkpoints: Vec<_> = (0..16).map(control_cache_checkpoint).collect();
+        for checkpoint in &checkpoints {
+            store.insert_certified_checkpoint(checkpoint).unwrap();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(checkpoints.len()));
+        let threads: Vec<_> = checkpoints
+            .into_iter()
+            .map(|checkpoint| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .update_highest_verified_checkpoint(&checkpoint)
+                        .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            *store
+                .get_highest_verified_checkpoint()
+                .unwrap()
+                .unwrap()
+                .sequence_number(),
+            15
+        );
+        assert_eq!(
+            store
+                .tables
+                .watermarks
+                .get(&CheckpointWatermark::HighestVerified)
+                .unwrap()
+                .unwrap()
+                .0,
+            15
+        );
+    }
+
+    #[cfg(tidehunter)]
+    #[tokio::test]
+    async fn test_checkpoint_control_cache_epoch_relocation_invalidation() {
+        let (_directory, store) = control_cache_store();
+        let checkpoint = control_cache_checkpoint(1);
+        store.insert_verified_checkpoint(&checkpoint).unwrap();
+        assert!(
+            store
+                .control_cache
+                .lock()
+                .summaries
+                .contains(checkpoint.digest())
+        );
+        store
+            .pruner_watermarks
+            .epoch_id
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        // Relocation may not yet have removed the durable row, but an eligible
+        // old summary must be checked in storage on each read.
+        store.get_highest_verified_checkpoint().unwrap();
+        assert!(
+            !store
+                .control_cache
+                .lock()
+                .summaries
+                .contains(checkpoint.digest())
+        );
+    }
 
     #[tokio::test]
     async fn test_clear_locally_computed_checkpoints_from_deletes_inclusive_range() {

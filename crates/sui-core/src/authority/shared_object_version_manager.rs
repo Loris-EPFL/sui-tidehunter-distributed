@@ -349,7 +349,7 @@ impl SharedObjVerManager {
         )],
         epoch_store: &AuthorityPerEpochStore,
         cache_reader: &dyn ObjectCacheRead,
-    ) -> AssignedTxAndVersions {
+    ) -> SuiResult<AssignedTxAndVersions> {
         // We don't care about the results since we can use effects to assign versions.
         // But we must call it to make sure whenever a consensus object is touched the first time
         // during an epoch, either through consensus or through checkpoint executor,
@@ -357,13 +357,13 @@ impl SharedObjVerManager {
         // of a consensus object in an epoch by reading the current version from the object store.
         // This must be done before we mutate it the first time, otherwise we would be initializing
         // it with the wrong version.
-        let _ = get_or_init_versions(
+        get_or_init_versions(
             certs_and_effects.iter().flat_map(|(cert, _, _)| {
                 cert.transaction_data().shared_input_objects().into_iter()
             }),
             epoch_store,
             cache_reader,
-        );
+        )?;
         let mut assigned_versions = Vec::new();
         for (cert, effects, accumulator_version) in certs_and_effects {
             let initial_version_map: BTreeMap<_, _> = cert
@@ -437,7 +437,7 @@ impl SharedObjVerManager {
                 AssignedVersions::new(cert_assigned_versions, system_object_versions),
             ));
         }
-        AssignedTxAndVersions::new(assigned_versions)
+        Ok(AssignedTxAndVersions::new(assigned_versions))
     }
 
     pub fn assign_versions_for_certificate(
@@ -1052,7 +1052,8 @@ mod tests {
                 .as_slice(),
             &epoch_store,
             authority.get_object_cache_reader().as_ref(),
-        );
+        )
+        .unwrap();
         // Check that the shared object's next version is always initialized in the epoch store.
         assert_eq!(
             epoch_store
@@ -1093,6 +1094,35 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_assign_versions_from_effects_propagates_initialization_error() {
+        let shared_object = Object::shared_for_testing();
+        let id = shared_object.id();
+        let initial_version = shared_object.owner.start_version().unwrap();
+        let authority = TestAuthorityBuilder::new()
+            .with_starting_objects(std::slice::from_ref(&shared_object))
+            .build()
+            .await;
+        let certificate =
+            generate_shared_objs_tx_with_gas_version(&[(id, initial_version, true)], 3);
+        let effects = TestEffectsBuilder::new(certificate.data()).build();
+        let epoch_store = authority.epoch_store_for_testing();
+        epoch_store.release_db_handles();
+
+        let error = epoch_store
+            .acquire_shared_version_assignments_from_effects(
+                &certificate,
+                &effects,
+                None,
+                authority.get_object_cache_reader().as_ref(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.as_inner(),
+            sui_types::error::SuiErrorKind::EpochEnded(epoch) if *epoch == epoch_store.epoch()
+        ));
     }
 
     /// Generate a transaction that uses shared objects as specified in the parameters.
