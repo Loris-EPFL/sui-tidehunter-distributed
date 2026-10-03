@@ -7,6 +7,7 @@ use crate::authority::authority_per_epoch_store::{
 use crate::authority::transaction_deferral::DeferralKey;
 use crate::checkpoints::BuilderCheckpointSummary;
 use crate::epoch::randomness::SINGLETON_KEY;
+use crate::fallback_fetch::do_fallback_lookup_fallible;
 use dashmap::DashMap;
 use fastcrypto_tbls::{dkg_v1, nodes::PartyId};
 use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId};
@@ -782,22 +783,21 @@ impl ConsensusOutputQuarantine {
         tables: &AuthorityEpochTables,
         objects_to_init: &[ConsensusObjectSequenceKey],
     ) -> SuiResult<Vec<Option<SequenceNumber>>> {
-        Ok(do_fallback_lookup(
+        do_fallback_lookup_fallible(
             objects_to_init,
             |object_key| {
                 if let Some(next_version) = self.shared_object_next_versions.get(object_key) {
-                    CacheResult::Hit(Some(*next_version))
+                    Ok(CacheResult::Hit(Some(*next_version)))
                 } else {
-                    CacheResult::Miss
+                    Ok(CacheResult::Miss)
                 }
             },
             |object_keys| {
-                tables
+                Ok(tables
                     .next_shared_object_versions_v2
-                    .multi_get(object_keys)
-                    .expect("db error")
+                    .multi_get(object_keys)?)
             },
-        ))
+        )
     }
 
     /// Gets owned object locks, checking quarantine first then falling back to DB.
@@ -1098,6 +1098,42 @@ mod tests {
             checkpoint_height: Some(height),
             position_in_commit: 0,
         }
+    }
+
+    #[cfg(not(tidehunter))]
+    #[tokio::test]
+    async fn test_shared_version_initialization_propagates_storage_read_error() {
+        let state = TestAuthorityBuilder::new().build().await;
+        let epoch_store = state.epoch_store_for_testing();
+        let tables = epoch_store.tables().unwrap();
+        let corrupt_key = (ObjectID::random(), SequenceNumber::from_u64(1));
+        let absent_key = (ObjectID::random(), SequenceNumber::from_u64(1));
+
+        // A real backend read must reject the malformed value rather than treating
+        // it as an uninitialized object and publishing a replacement version.
+        let malformed_versions: DBMap<ConsensusObjectSequenceKey, u8> = DBMap::reopen(
+            &tables.next_shared_object_versions_v2.db,
+            Some(tables.next_shared_object_versions_v2.cf_name()),
+            &ReadWriteOptions::default(),
+            false,
+        )
+        .unwrap();
+        malformed_versions.insert(&corrupt_key, &0).unwrap();
+
+        let error = epoch_store
+            .get_or_init_next_object_versions(
+                &[corrupt_key, absent_key],
+                state.get_object_cache_reader().as_ref(),
+            )
+            .unwrap_err();
+        assert!(matches!(error.as_inner(), SuiErrorKind::Storage(_)));
+        assert_eq!(
+            tables
+                .next_shared_object_versions_v2
+                .get(&absent_key)
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

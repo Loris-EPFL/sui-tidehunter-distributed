@@ -785,7 +785,12 @@ impl AuthorityStorePruner {
             return Ok(false);
         }
         info!("relocation: setting epoch watermark to {}", new_watermark);
+        #[cfg(tidehunter)]
         checkpoint_store.update_pruning_epoch(pruning_watermark, new_watermark);
+        #[cfg(not(tidehunter))]
+        pruning_watermark
+            .epoch_id
+            .store(new_watermark, Ordering::Relaxed);
         if let Some(checkpoint_id) = checkpoint_id {
             let watermark = if objects_compactor_active {
                 checkpoint_id
