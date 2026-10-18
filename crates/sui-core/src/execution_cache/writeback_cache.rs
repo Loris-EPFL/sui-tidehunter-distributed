@@ -923,12 +923,25 @@ impl WritebackCache {
 
     fn record_db_get(&self, request_type: &'static str) -> &AuthorityStore {
         self.metrics.record_cache_request(request_type, "db");
+        self.metrics
+            .db_read_calls
+            .with_label_values(&[request_type, "scalar"])
+            .inc();
         &self.store
     }
 
     fn record_db_multi_get(&self, request_type: &'static str, count: usize) -> &AuthorityStore {
         self.metrics
             .record_cache_multi_request(request_type, "db", count);
+        let shape = match count {
+            0 => "empty",
+            1 => "singleton",
+            _ => "multi",
+        };
+        self.metrics
+            .db_read_calls
+            .with_label_values(&[request_type, shape])
+            .inc();
         &self.store
     }
 
@@ -2309,7 +2322,7 @@ impl TransactionCacheRead for WritebackCache {
             |remaining| {
                 let remaining_digests: Vec<_> = remaining.iter().map(|(d, _)| *d).collect();
                 let results = self
-                    .store
+                    .record_db_multi_get("transaction_events", remaining_digests.len())
                     .multi_get_events(&remaining_digests)
                     .expect("db error");
                 for ((digest, ticket), result) in remaining.iter().zip_debug_eq(results.iter()) {
@@ -2334,7 +2347,7 @@ impl TransactionCacheRead for WritebackCache {
             .get(digest)
             .map(|b| b.clone())
             .or_else(|| {
-                self.store
+                self.record_db_get("unchanged_loaded_runtime_objects")
                     .get_unchanged_loaded_runtime_objects(digest)
                     .expect("db error")
             })
@@ -2351,7 +2364,7 @@ impl TransactionCacheRead for WritebackCache {
                 None => CacheResult::Miss,
             },
             |digests| {
-                self.store
+                self.record_db_multi_get("unchanged_loaded_runtime_objects", digests.len())
                     .multi_get_unchanged_loaded_runtime_objects(digests)
                     .expect("db error")
             },

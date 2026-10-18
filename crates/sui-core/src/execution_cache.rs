@@ -420,8 +420,10 @@ pub trait ObjectCacheRead: Send + Sync {
     /// can start execution.
     /// `input_and_receiving_keys` contains both input objects and receiving
     /// input objects, including canceled objects.
-    /// TODO: Eventually this can return the objects read results,
-    /// so that execution does not need to load them again.
+    /// This reports readiness, not payload ownership. Exact-version DB reads are not
+    /// positive read-through cache inserts, so fetching and discarding objects here
+    /// does not make execution reuse them. Any prefetch must transfer bounded payload
+    /// ownership to the input loader while preserving dirty-cache and marker checks.
     fn notify_read_input_objects<'a>(
         &'a self,
         input_and_receiving_keys: &'a [InputKey],
@@ -712,6 +714,10 @@ macro_rules! implement_storage_traits {
                 version: sui_types::base_types::VersionNumber,
             ) -> Option<Object> {
                 ObjectCacheRead::get_object_by_key(self, object_id, version)
+            }
+
+            fn multi_get_objects_by_key(&self, object_keys: &[ObjectKey]) -> Vec<Option<Object>> {
+                ObjectCacheRead::multi_get_objects_by_key(self, object_keys)
             }
 
             fn load_implicitly_read_system_object(

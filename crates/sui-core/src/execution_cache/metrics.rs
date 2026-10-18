@@ -13,6 +13,7 @@ use prometheus::{
 pub struct ExecutionCacheMetrics {
     pub(crate) pending_notify_read: IntGauge,
     pub(crate) cache_requests: IntCounterVec,
+    pub(crate) db_read_calls: IntCounterVec,
     pub(crate) cache_hits: IntCounterVec,
     pub(crate) cache_negative_hits: IntCounterVec,
     pub(crate) cache_misses: IntCounterVec,
@@ -37,8 +38,15 @@ impl ExecutionCacheMetrics {
             // level in these metrics may be "uncommitted", "committed", "package_cache" or "db"
             cache_requests: register_int_counter_vec_with_registry!(
                 "execution_cache_requests",
-                "Execution cache requests",
+                "Execution cache keys requested (not API calls)",
                 &["request_type", "level"],
+                registry,
+            )
+            .unwrap(),
+            db_read_calls: register_int_counter_vec_with_registry!(
+                "execution_cache_db_read_calls",
+                "AuthorityStore read calls, including empty bulk fallbacks; not transport calls",
+                &["request_type", "shape"],
                 registry,
             )
             .unwrap(),
