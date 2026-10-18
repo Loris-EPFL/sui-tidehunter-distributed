@@ -1054,9 +1054,7 @@ pub async fn download_formal_snapshot(
     // and reduce startup time. No-op when compiled without tidehunter.
     #[cfg(tidehunter)]
     {
-        perpetual_db
-            .force_rebuild_control_region()
-            .expect("Failed to rebuild tidehunter control region after snapshot restore");
+        perpetual_db.force_rebuild_control_region()?;
         // The tidehunter Db spawns background threads (periodic snapshot, relocator,
         // flusher pool, etc.) that own file handles inside the staging directory.
         // Wait for them to exit before renaming staging -> live, otherwise a
@@ -1064,7 +1062,7 @@ pub async fn download_formal_snapshot(
         println!(
             "Waiting for tidehunter background threads to finish before renaming staging to live"
         );
-        perpetual_db.wait_for_tidehunter_background_threads();
+        perpetual_db.wait_for_tidehunter_background_threads()?;
         println!("Tidehunter background threads finished, proceeding with rename");
     }
 

@@ -30,18 +30,13 @@ pub fn validate_distributed_node_role(
     runs_consensus: bool,
     bounded_replay: bool,
 ) -> std::io::Result<()> {
-    #[cfg(tidehunter)]
-    {
-        tidehunter::storage_integration::validate_node_role(runs_consensus, bounded_replay)
-    }
-    #[cfg(not(tidehunter))]
-    {
-        let _ = (runs_consensus, bounded_replay);
-        Err(std::io::Error::new(
+    if cfg!(feature = "sharded-wal") && (!cfg!(tidehunter) || runs_consensus || !bounded_replay) {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "distributed storage session requires USE_TIDEHUNTER and the distributed facade",
-        ))
+            "sharded-wal requires USE_TIDEHUNTER and bounded non-consensus checkpoint replay",
+        ));
     }
+    Ok(())
 }
 
 pub type StoreError = typed_store_error::TypedStoreError;

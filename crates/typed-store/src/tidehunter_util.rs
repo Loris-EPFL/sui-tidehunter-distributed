@@ -3,16 +3,19 @@
 
 use crate::{DBMetrics, StorageType, rocks::MetricConf, util::ensure_database_type};
 use bincode::Options;
+use mysten_common::ZipDebugEqIteratorExt;
 use mysten_metrics::RegistryID;
 use prometheus::{HistogramTimer, Registry};
 use serde::de::DeserializeOwned;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(not(feature = "sharded-wal"))]
 use tidehunter::compressed_batch::BatchCodec;
+#[cfg(not(feature = "sharded-wal"))]
 use tidehunter::config::Config;
-use tidehunter::db::Db;
-use tidehunter::iterators::db_iterator::DbIterator;
+pub use tidehunter::distributed::sui::Db;
+use tidehunter::distributed::sui::DbIterator;
 use tidehunter::key_shape::KeyShape;
 use tidehunter::metrics::Metrics;
 pub use tidehunter::{
@@ -41,11 +44,299 @@ pub fn open(path: &Path, key_shape: KeyShape, metric_conf: &MetricConf) -> (Arc<
     // `Db::open` reconciles the declared shape against the persisted registry
     // (matching by name; supports reorder/add/remove). Callers resolve each
     // column family's handle by name via `Db::ks`.
-    let db = Db::open(path, key_shape, Arc::new(thdb_config(metric_conf)), metrics)
-        .expect("failed to open tidehunter db");
-    destroy_undeclared_key_spaces(&db, path);
-    db.start_periodic_snapshot();
+    let db = open_backend(path, key_shape, metric_conf, metrics);
+    if let Some(native) = db.native() {
+        destroy_undeclared_key_spaces(native, path);
+        native.start_periodic_snapshot();
+    }
+    db.set_native_durable(parse_env_bool("TH_SYNC_WRITES").unwrap_or(false));
+    let read_profile_limit = env::var("SUI_TH_READ_PROFILE_LIMIT")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .expect("SUI_TH_READ_PROFILE_LIMIT must be a u64")
+        })
+        .unwrap_or(0);
+    db.set_read_profile_limit(read_profile_limit);
+    let native_write_profile_limit = env::var("SUI_TH_NATIVE_WRITE_PROFILE_LIMIT")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .expect("SUI_TH_NATIVE_WRITE_PROFILE_LIMIT must be a u64")
+        })
+        .unwrap_or(0);
+    db.set_native_write_profile_limit(native_write_profile_limit);
+    export_schema(path, &db);
+    register_remote_metrics(&registry, &db, path);
     (db, registry_id)
+}
+
+#[cfg(feature = "sharded-wal")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShardedWalConfig {
+    root: std::path::PathBuf,
+    databases: std::collections::BTreeMap<
+        String,
+        tidehunter::distributed::remote_db::RemoteDatabaseConfig,
+    >,
+}
+
+#[cfg(feature = "sharded-wal")]
+fn sharded_config() -> Option<ShardedWalConfig> {
+    env::var_os("SUI_SHARDED_WAL_CONFIG").map(|path| {
+        let bytes = std::fs::read(path).expect("read SUI_SHARDED_WAL_CONFIG");
+        serde_json::from_slice(&bytes).expect("parse SUI_SHARDED_WAL_CONFIG")
+    })
+}
+
+fn configured_root() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "sharded-wal")]
+    if let Some(config) = sharded_config() {
+        return Some(config.root);
+    }
+    env::var_os("SUI_SHARDED_WAL_ROOT").map(Into::into)
+}
+
+fn namespace(path: &Path, root: &Path) -> String {
+    let root = root.canonicalize().expect("canonicalize Sui database root");
+    let path = path.canonicalize().expect("canonicalize Sui database path");
+    let relative = path
+        .strip_prefix(root)
+        .expect("Tidehunter DB outside configured Sui root");
+    assert!(
+        !relative.as_os_str().is_empty(),
+        "DB namespace must not be empty"
+    );
+    relative.to_str().expect("UTF-8 DB namespace").to_owned()
+}
+
+fn open_backend(
+    path: &Path,
+    shape: KeyShape,
+    metric_conf: &MetricConf,
+    metrics: Arc<Metrics>,
+) -> Arc<Db> {
+    #[cfg(feature = "sharded-wal")]
+    {
+        let config = sharded_config()
+            .expect("sharded-wal requires SUI_SHARDED_WAL_CONFIG; native fallback is forbidden");
+        let name = namespace(path, &config.root);
+        let remote = config
+            .databases
+            .get(&name)
+            .unwrap_or_else(|| panic!("missing exact sharded-wal namespace {name:?}"))
+            .clone();
+        let _ = (metric_conf, metrics);
+        Db::open_remote(path, shape, remote).expect("open sharded-wal Sui database")
+    }
+    #[cfg(not(feature = "sharded-wal"))]
+    {
+        assert!(
+            env::var_os("SUI_SHARDED_WAL_CONFIG").is_none(),
+            "SUI_SHARDED_WAL_CONFIG requires the sharded-wal feature"
+        );
+        assert!(
+            !path.join("tcp-database-authority-v1").exists(),
+            "native control cannot open a sharded-wal authority"
+        );
+        Db::open_native(path, shape, Arc::new(thdb_config(metric_conf)), metrics)
+            .expect("open native Tidehunter database")
+    }
+}
+
+fn export_schema(path: &Path, db: &Db) {
+    let Some(output) = env::var_os("SUI_SHARDED_WAL_SCHEMA_OUTPUT") else {
+        return;
+    };
+    let root = configured_root()
+        .expect("schema export requires SUI_SHARDED_WAL_ROOT or remote config root");
+    let name = namespace(path, &root);
+    let output = std::path::PathBuf::from(output).join(&name);
+    std::fs::create_dir_all(&output).expect("create schema output directory");
+    std::fs::write(
+        output.join("shape.json"),
+        serde_json::to_vec_pretty(db.shape()).expect("serialize key shape"),
+    )
+    .expect("export key shape");
+    std::fs::write(
+        output.join("shape.yaml"),
+        db.shape_yaml().expect("serialize canonical key shape YAML"),
+    )
+    .expect("export canonical key shape YAML");
+    let manifest = serde_json::json!({
+        "namespace": name, "path": path,
+        "backend": if db.native().is_some() { "native" } else { "sharded-wal" }
+    });
+    std::fs::write(
+        output.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("serialize schema manifest"),
+    )
+    .expect("export schema manifest");
+}
+
+struct KeyspaceCacheGauges {
+    hits: prometheus::IntGauge,
+    misses: prometheus::IntGauge,
+    inserts: prometheus::IntGauge,
+    evictions: prometheus::IntGauge,
+}
+
+struct AdapterCollector {
+    db: std::sync::Weak<Db>,
+    values: prometheus::IntGaugeVec,
+    keyspace_cache: Option<(prometheus::IntGaugeVec, Box<[KeyspaceCacheGauges]>)>,
+    io: Option<tidehunter::distributed::remote_db::ReadIoMonitor>,
+}
+impl prometheus::core::Collector for AdapterCollector {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        let mut desc = self.values.desc();
+        if let Some((keyspace_cache, _)) = &self.keyspace_cache {
+            desc.extend(keyspace_cache.desc());
+        }
+        desc
+    }
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        use std::sync::atomic::Ordering;
+        if let Some(db) = self.db.upgrade() {
+            let set = |name: &str, value: u64| {
+                self.values
+                    .with_label_values(&[name])
+                    .set(value.min(i64::MAX as u64) as i64);
+            };
+            set("read_calls", db.read_calls.load(Ordering::Relaxed));
+            set("read_keys", db.read_keys.load(Ordering::Relaxed));
+            set("scan_records", db.scan_records.load(Ordering::Relaxed));
+            db.visit_timing_metrics(set);
+            if let Some((cache, writes, rpcs)) = db.remote_counters() {
+                set("read_rpcs", rpcs);
+                set("cache_hits", cache.hits);
+                set("cache_misses", cache.misses);
+                set("cache_evictions", cache.evictions);
+                set("cache_retained_bytes", cache.retained_bytes as u64);
+                set("cache_budget_bytes", cache.budget_bytes as u64);
+                set("cache_metadata_bytes", cache.metadata_bytes as u64);
+                set(
+                    "cache_per_keyspace_counters_bytes",
+                    cache.per_keyspace_counters_bytes as u64,
+                );
+                set("cache_served_bytes", cache.served_bytes);
+                set("published_batches", writes.published_batches);
+                set("write_validation_ns", writes.validation_ns);
+                set("write_storage_wait_ns", writes.storage_wait_ns);
+                set("write_publication_ns", writes.publication_ns);
+                set("read_index_ns", writes.read_resolve_ns);
+                set("read_wait_ns", writes.value_read_ns);
+            }
+            if let Some(monitor) = &self.io {
+                match monitor.sample() {
+                    Ok(samples) => {
+                        set("shard_sample_available", 1);
+                        set(
+                            "shard_cache_hits",
+                            samples.iter().map(|(_, s)| s.cache_hits).sum(),
+                        );
+                        set(
+                            "shard_cache_misses",
+                            samples.iter().map(|(_, s)| s.cache_misses).sum(),
+                        );
+                        set(
+                            "shard_cache_bytes",
+                            samples.iter().map(|(_, s)| s.cache_bytes as u64).sum(),
+                        );
+                        set(
+                            "shard_wal_reads",
+                            samples.iter().map(|(_, s)| s.wal_reads).sum(),
+                        );
+                        set(
+                            "shard_wal_read_bytes",
+                            samples.iter().map(|(_, s)| s.wal_read_bytes).sum(),
+                        );
+                        set(
+                            "shard_async_read_submissions",
+                            samples.iter().map(|(_, s)| s.async_read_submissions).sum(),
+                        );
+                        set(
+                            "shard_read_errors",
+                            samples.iter().map(|(_, s)| s.errors).sum(),
+                        );
+                    }
+                    Err(error) => {
+                        set("shard_sample_available", 0);
+                        tracing::warn!(?error, "sharded WAL diagnostic sample unavailable");
+                    }
+                }
+            }
+            if let (Some(counters), Some((_, gauges))) =
+                (db.remote_keyspace_cache_counters(), &self.keyspace_cache)
+            {
+                for (gauge, stats) in gauges.iter().zip_debug_eq(counters.iter()) {
+                    gauge.hits.set(stats.hits.min(i64::MAX as u64) as i64);
+                    gauge.misses.set(stats.misses.min(i64::MAX as u64) as i64);
+                    gauge.inserts.set(stats.inserts.min(i64::MAX as u64) as i64);
+                    gauge
+                        .evictions
+                        .set(stats.evictions.min(i64::MAX as u64) as i64);
+                }
+            }
+        }
+        let mut families = self.values.collect();
+        if let Some((keyspace_cache, _)) = &self.keyspace_cache {
+            families.extend(keyspace_cache.collect());
+        }
+        families
+    }
+}
+fn register_remote_metrics(registry: &Registry, db: &Arc<Db>, path: &Path) {
+    let root = configured_root();
+    let name = root.map_or_else(|| path.display().to_string(), |root| namespace(path, &root));
+    let values = prometheus::IntGaugeVec::new(
+        prometheus::Opts::new(
+            "tidehunter_adapter",
+            "Cumulative adapter counters and current bounded-cache gauges",
+        )
+        .const_label("namespace", name.clone()),
+        &["stat"],
+    )
+    .expect("adapter metric definition");
+    let io = db.remote_io_monitor();
+    let keyspace_cache = io.as_ref().map(|_| {
+        let cache = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "tidehunter_keyspace_read_cache",
+                "Cumulative read-cache counters by canonical Tidehunter keyspace id",
+            )
+            .const_label("namespace", name.clone()),
+            &["keyspace", "keyspace_id", "stat"],
+        )
+        .expect("keyspace read-cache metric definition");
+        let gauges = db
+            .shape()
+            .iter_ks()
+            .enumerate()
+            .take(tidehunter::distributed::remote_db::KEYSPACE_COUNTER_COUNT)
+            .map(|(id, descriptor)| {
+                let id = id.to_string();
+                let gauge = |stat| cache.with_label_values(&[descriptor.name(), &id, stat]);
+                KeyspaceCacheGauges {
+                    hits: gauge("hits"),
+                    misses: gauge("misses"),
+                    inserts: gauge("inserts"),
+                    evictions: gauge("evictions"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        (cache, gauges)
+    });
+    registry
+        .register(Box::new(AdapterCollector {
+            db: Arc::downgrade(db),
+            values,
+            keyspace_cache,
+            io,
+        }))
+        .expect("register Tidehunter adapter counters");
 }
 
 /// Destroys key spaces that exist in the database but are no longer declared
@@ -53,8 +344,9 @@ pub fn open(path: &Path, key_shape: KeyShape, metric_conf: &MetricConf) -> (Arc<
 /// `Db::open` retains such key spaces internally (data preserved, not
 /// exposed); destroying them persists a registry tombstone so their data is
 /// dropped and disk space is reclaimed through the regular GC cadences.
-fn destroy_undeclared_key_spaces(db: &Db, path: &Path) {
-    let registry = Db::load_key_shape(path).expect("failed to load tidehunter key shape registry");
+fn destroy_undeclared_key_spaces(db: &tidehunter::db::Db, path: &Path) {
+    let registry = tidehunter::db::Db::load_key_shape(path)
+        .expect("failed to load tidehunter key shape registry");
     for ks in registry.iter_ks() {
         if ks.destroyed() || db.try_ks(ks.name()).is_some() {
             continue;
@@ -111,6 +403,7 @@ pub fn default_max_dirty_keys() -> usize {
     parse_env_usize("TH_DEFAULT_MAX_DIRTY_KEYS", 1).unwrap_or(1024)
 }
 
+#[cfg(not(feature = "sharded-wal"))]
 fn thdb_config(metric_conf: &MetricConf) -> Config {
     let frag_size = if let Ok(frag_size) = env::var("TH_FRAG_SIZE") {
         let frag_size = frag_size.parse().expect("Failed to parse TH_FRAG_SIZE");
@@ -157,12 +450,6 @@ fn thdb_config(metric_conf: &MetricConf) -> Config {
         .enable_th_batch_compression
         .then_some(4 * 1024 * 1024 * 1024);
     let mut config = Config {
-        // TEST-ONLY: preserve matched native/facade acknowledgment guarantees.
-        #[cfg(feature = "distributed-tidehunter-durability")]
-        sync_writes: parse_env_bool("TH_SYNC_WRITES").unwrap_or(false),
-        #[cfg(feature = "distributed-tidehunter-durability")]
-        coalesce_wal_directory_sync: parse_env_bool("TH_COALESCE_WAL_DIRECTORY_SYNC")
-            .unwrap_or(false),
         frag_size,
         // run snapshot every 8 Gb written to wal
         snapshot_written_bytes: parse_env_usize("TH_SNAPSHOT_WRITTEN_BYTES", 1)
@@ -213,10 +500,10 @@ pub(crate) fn apply_range_bounds(
     // length prefix. Tidehunter stores keys with the prefix stripped, so the
     // bounds must be stripped to match — same transform every other key path uses.
     if let Some(lower_bound) = lower_bound {
-        iterator.set_lower_bound(transform_th_key(&lower_bound, prefix));
+        iterator.set_lower_bound(transform_th_key(&lower_bound, prefix).to_vec());
     }
     if let Some(upper_bound) = upper_bound {
-        iterator.set_upper_bound(transform_th_key(&upper_bound, prefix));
+        iterator.set_upper_bound(transform_th_key(&upper_bound, prefix).to_vec());
     }
 }
 
@@ -260,10 +547,11 @@ where
     })
 }
 
-pub(crate) fn transform_th_key(key: &[u8], prefix: &Option<Vec<u8>>) -> Vec<u8> {
+/// Borrow the stored-key suffix; scalar reads do not need a second key allocation.
+pub(crate) fn transform_th_key<'a>(key: &'a [u8], prefix: &Option<Vec<u8>>) -> &'a [u8] {
     match prefix {
-        Some(prefix) => key[prefix.len()..].to_vec(),
-        None => key.to_vec(),
+        Some(prefix) => &key[prefix.len()..],
+        None => key,
     }
 }
 

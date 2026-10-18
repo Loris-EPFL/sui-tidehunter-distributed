@@ -5,6 +5,12 @@ fn main() {
     // This build script enables tidehunter config used to gate tidehunter in sui codebase
     println!("cargo::rerun-if-env-changed=USE_TIDEHUNTER");
     println!("cargo::rustc-check-cfg=cfg(tidehunter)");
+    if std::env::var_os("CARGO_FEATURE_SHARDED_WAL").is_some() {
+        assert!(
+            std::env::var_os("USE_TIDEHUNTER").is_some(),
+            "sharded-wal requires USE_TIDEHUNTER=1 throughout the Sui build"
+        );
+    }
     if std::env::var("USE_TIDEHUNTER").is_ok() {
         println!("cargo::rustc-cfg=tidehunter");
     }

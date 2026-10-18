@@ -49,7 +49,7 @@ use std::{
 use std::{collections::HashSet, ffi::CStr};
 use sui_macros::{fail_point, nondeterministic};
 #[cfg(tidehunter)]
-use tidehunter::{db::Db as TideHunterDb, key_shape::KeySpace};
+use tidehunter::{distributed::sui::Db as TideHunterDb, key_shape::KeySpace};
 use tokio::sync::oneshot;
 use tracing::{debug, error, instrument, warn};
 
@@ -193,9 +193,12 @@ impl Database {
                 Ok(())
             }
             #[cfg(tidehunter)]
-            Storage::TideHunter(_) => {
-                // TideHunter doesn't support an explicit flush.
-                Ok(())
+            Storage::TideHunter(db) => {
+                if db.native().is_some() {
+                    Ok(())
+                } else {
+                    db.flush().map_err(typed_store_error_from_th_error)
+                }
             }
         }
     }
@@ -217,7 +220,7 @@ impl Database {
             }
             #[cfg(tidehunter)]
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => Ok(db
-                .get(*ks, &transform_th_key(key.as_ref(), prefix))
+                .get(*ks, transform_th_key(key.as_ref(), prefix))
                 .map_err(typed_store_error_from_th_error)?
                 .map(GetResult::TideHunter)),
 
@@ -254,7 +257,7 @@ impl Database {
             }
             #[cfg(tidehunter)]
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => db
-                .exists(*ks, &transform_th_key(key, prefix))
+                .exists(*ks, transform_th_key(key, prefix))
                 .map_err(typed_store_error_from_th_error),
             _ => Err(TypedStoreError::RocksDBError(
                 "typed store invariant violation".to_string(),
@@ -280,7 +283,7 @@ impl Database {
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => {
                 let keys: Vec<_> = keys
                     .into_iter()
-                    .map(|k| transform_th_key(k.as_ref(), prefix))
+                    .map(|k| transform_th_key(k.as_ref(), prefix).to_vec())
                     .collect();
                 db.multi_exists(*ks, &keys)
                     .into_iter()
@@ -291,7 +294,7 @@ impl Database {
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => keys
                 .into_iter()
                 .map(|k| {
-                    db.exists(*ks, &transform_th_key(k.as_ref(), prefix))
+                    db.exists(*ks, transform_th_key(k.as_ref(), prefix))
                         .map_err(typed_store_error_from_th_error)
                 })
                 .collect(),
@@ -338,7 +341,7 @@ impl Database {
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => {
                 let keys: Vec<_> = keys
                     .into_iter()
-                    .map(|k| transform_th_key(k.as_ref(), prefix))
+                    .map(|k| transform_th_key(k.as_ref(), prefix).to_vec())
                     .collect();
                 db.multi_get(*ks, &keys)
                     .into_iter()
@@ -352,7 +355,7 @@ impl Database {
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => keys
                 .into_iter()
                 .map(|k| {
-                    db.get(*ks, &transform_th_key(k.as_ref(), prefix))
+                    db.get(*ks, transform_th_key(k.as_ref(), prefix))
                         .map_err(typed_store_error_from_th_error)
                         .map(|item| item.map(|bytes| GetResult::TideHunter(bytes.into_owned())))
                 })
@@ -361,13 +364,20 @@ impl Database {
         }
     }
 
-    pub fn drop_cf(&self, name: &str) -> Result<(), rocksdb::Error> {
+    pub fn drop_cf(&self, name: &str) -> Result<(), TypedStoreError> {
         match &self.storage {
-            Storage::Rocks(db) => db.underlying.drop_cf(name),
+            Storage::Rocks(db) => db
+                .underlying
+                .drop_cf(name)
+                .map_err(typed_store_err_from_rocks_err),
             Storage::InMemory(db) => {
                 db.drop_cf(name);
                 Ok(())
             }
+            #[cfg(tidehunter)]
+            Storage::TideHunter(db) if db.native().is_none() => Err(TypedStoreError::RocksDBError(
+                "sharded-wal schema changes require an explicit coordinated migration".into(),
+            )),
             #[cfg(tidehunter)]
             Storage::TideHunter(_) => {
                 unimplemented!("TideHunter: deletion of column family on a fly not implemented")
@@ -400,7 +410,7 @@ impl Database {
             }
             #[cfg(tidehunter)]
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => db
-                .remove(*ks, transform_th_key(key.as_ref(), prefix))
+                .remove(*ks, transform_th_key(key.as_ref(), prefix).to_vec())
                 .map_err(typed_store_error_from_th_error),
             _ => Err(TypedStoreError::RocksDBError(
                 "typed store invariant violation".to_string(),
@@ -436,7 +446,7 @@ impl Database {
             }
             #[cfg(tidehunter)]
             (Storage::TideHunter(db), ColumnFamily::TideHunter((ks, prefix))) => db
-                .insert(*ks, transform_th_key(&key, prefix), value)
+                .insert(*ks, transform_th_key(&key, prefix).to_vec(), value)
                 .map_err(typed_store_error_from_th_error),
             _ => Err(TypedStoreError::RocksDBError(
                 "typed store invariant violation".to_string(),
@@ -480,7 +490,8 @@ impl Database {
     #[cfg(tidehunter)]
     pub fn start_relocation(&self) -> anyhow::Result<()> {
         if let Storage::TideHunter(db) = &self.storage {
-            db.start_relocation()?;
+            db.start_relocation()
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         }
         Ok(())
     }
@@ -496,25 +507,22 @@ impl Database {
 
     /// Wait for tidehunter background threads to finish.
     ///
-    /// Consumes the `Arc<Database>`. Caller must ensure no other clones of this
-    /// `Arc<Database>` (e.g. via `DBMap::db`) are alive — otherwise the inner
-    /// `Arc<TideHunterDb>` strong count will not reach zero and the wait will
-    /// poll until it panics.
+    /// Consumes the `Arc<Database>`. Other owners must release their clones first.
+    /// Remaining owners or a distributed shutdown failure return an error.
     #[cfg(tidehunter)]
-    pub fn wait_for_tidehunter_background_threads(self: Arc<Self>) {
-        let strong = Arc::strong_count(&self);
-        if strong != 1 {
-            println!(
-                "WARNING: wait_for_tidehunter_background_threads called with Arc<Database> strong_count={} (expected 1); other clones will keep the inner tidehunter Db alive and the wait may panic on timeout",
-                strong,
-            );
-        }
+    pub fn wait_for_tidehunter_background_threads(self: Arc<Self>) -> anyhow::Result<()> {
         let Storage::TideHunter(th_arc) = &self.storage else {
-            return;
+            return Ok(());
         };
+        anyhow::ensure!(
+            Arc::strong_count(&self) == 1,
+            "cannot close Tidehunter while Database owners remain"
+        );
         let th_arc = th_arc.clone();
         drop(self);
-        th_arc.wait_for_background_threads_to_finish();
+        th_arc
+            .wait_for_background_threads_to_finish()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
     #[cfg(tidehunter)]
@@ -538,12 +546,19 @@ impl Database {
         cf_name: &str,
         start: Option<K>,
         end: Option<K>,
-    ) {
+    ) -> Result<(), TypedStoreError> {
         if let Storage::Rocks(rocksdb) = &self.storage {
             rocksdb
                 .underlying
                 .compact_range_cf(&rocks_cf(rocksdb, cf_name), start, end);
         }
+        #[cfg(tidehunter)]
+        if matches!(&self.storage, Storage::TideHunter(db) if db.native().is_none()) {
+            return Err(TypedStoreError::RocksDBError(
+                "sharded-wal has no RocksDB range-compaction operation".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn checkpoint(&self, path: &Path) -> Result<(), TypedStoreError> {
@@ -554,6 +569,12 @@ impl Database {
             checkpoint
                 .create_checkpoint(path)
                 .map_err(|e| TypedStoreError::RocksDBError(e.to_string()))?;
+        }
+        #[cfg(tidehunter)]
+        if matches!(&self.storage, Storage::TideHunter(db) if db.native().is_none()) {
+            return Err(TypedStoreError::RocksDBError(
+                "sharded-wal directory copies are not database checkpoints; use coordinated checkpoint/audit".into(),
+            ));
         }
         Ok(())
     }
@@ -796,8 +817,7 @@ impl<K, V> DBMap<K, V> {
         let from_buf = be_fix_int_ser(start);
         let to_buf = be_fix_int_ser(end);
         self.db
-            .compact_range_cf(&self.cf, Some(from_buf), Some(to_buf));
-        Ok(())
+            .compact_range_cf(&self.cf, Some(from_buf), Some(to_buf))
     }
 
     pub fn compact_range_raw(
@@ -806,8 +826,7 @@ impl<K, V> DBMap<K, V> {
         start: Vec<u8>,
         end: Vec<u8>,
     ) -> Result<(), TypedStoreError> {
-        self.db.compact_range_cf(cf_name, Some(start), Some(end));
-        Ok(())
+        self.db.compact_range_cf(cf_name, Some(start), Some(end))
     }
 
     #[cfg(tidehunter)]
@@ -1342,7 +1361,7 @@ pub enum StorageWriteBatch {
     Rocks(rocksdb::WriteBatch),
     InMemory(InMemoryBatch),
     #[cfg(tidehunter)]
-    TideHunter(tidehunter::batch::WriteBatch),
+    TideHunter(tidehunter::distributed::sui::WriteBatch),
 }
 
 /// Flat-buffer entry header. All byte data (cf_name, key, value) is stored
@@ -1566,12 +1585,11 @@ impl DBBatch {
     }
 
     pub fn size_in_bytes(&self) -> usize {
-        match self.batch {
-            StorageWriteBatch::Rocks(ref b) => b.size_in_bytes(),
+        match &self.batch {
+            StorageWriteBatch::Rocks(b) => b.size_in_bytes(),
             StorageWriteBatch::InMemory(_) => 0,
-            // TODO: implement size_in_bytes method
             #[cfg(tidehunter)]
-            StorageWriteBatch::TideHunter(_) => 0,
+            StorageWriteBatch::TideHunter(batch) => batch.size_in_bytes(),
         }
     }
 
@@ -1650,7 +1668,7 @@ impl DBBatch {
                     }
                     #[cfg(tidehunter)]
                     (StorageWriteBatch::TideHunter(b), ColumnFamily::TideHunter((ks, prefix))) => {
-                        b.delete(*ks, transform_th_key(&k_buf, prefix))
+                        b.delete(*ks, transform_th_key(&k_buf, prefix).to_vec())
                     }
                     _ => Err(TypedStoreError::RocksDBError(
                         "typed store invariant violation".to_string(),
@@ -1689,6 +1707,13 @@ impl DBBatch {
                 from_buf,
                 to_buf,
             );
+        } else {
+            #[cfg(tidehunter)]
+            if matches!(&self.database.storage, Storage::TideHunter(db) if db.native().is_none()) {
+                return Err(TypedStoreError::RocksDBError(
+                    "sharded-wal range tombstones are unsupported; use explicit atomic deletes or cell pruning".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1727,9 +1752,12 @@ impl DBBatch {
                         b.put_cf(name, k_buf, v_buf)
                     }
                     #[cfg(tidehunter)]
-                    (StorageWriteBatch::TideHunter(b), ColumnFamily::TideHunter((ks, prefix))) => {
-                        b.write(*ks, transform_th_key(&k_buf, prefix), v_buf.to_vec())
-                    }
+                    (StorageWriteBatch::TideHunter(b), ColumnFamily::TideHunter((ks, prefix))) => b
+                        .write(
+                            *ks,
+                            transform_th_key(&k_buf, prefix).to_vec(),
+                            v_buf.to_vec(),
+                        ),
                     _ => Err(TypedStoreError::RocksDBError(
                         "typed store invariant violation".to_string(),
                     ))?,
@@ -2122,6 +2150,12 @@ where
                 .try_catch_up_with_primary()
                 .map_err(typed_store_err_from_rocks_err)?;
         }
+        #[cfg(tidehunter)]
+        if matches!(&self.db.storage, Storage::TideHunter(db) if db.native().is_none()) {
+            return Err(TypedStoreError::RocksDBError(
+                "sharded-wal has no secondary database mode".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -2273,7 +2307,7 @@ async fn safe_drop_rocksdb(path: PathBuf, timeout: Duration) -> Result<(), std::
 fn is_tidehunter_db(path: &Path) -> bool {
     // `shape_v2.yaml` is written by TideHunterDb::open at the DB root; RocksDB
     // never creates it.
-    path.join("shape_v2.yaml").exists()
+    path.join("shape_v2.yaml").exists() || path.join("tcp-database-authority-v1").exists()
 }
 
 #[cfg(tidehunter)]

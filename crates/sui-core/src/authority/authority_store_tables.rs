@@ -465,17 +465,14 @@ impl AuthorityPerpetualTables {
     /// `Arc<Database>` clones held by the column family `DBMap`s are released as
     /// part of the drop, leaving only the `Arc<Database>` extracted here.
     #[cfg(tidehunter)]
-    pub fn wait_for_tidehunter_background_threads(self: Arc<Self>) {
-        let strong = Arc::strong_count(&self);
-        if strong != 1 {
-            println!(
-                "WARNING: wait_for_tidehunter_background_threads called with Arc<AuthorityPerpetualTables> strong_count={} (expected 1); other clones will keep DBMap.db Arc<Database> alive past drop(self) and the inner Database wait will warn/timeout",
-                strong,
-            );
-        }
+    pub fn wait_for_tidehunter_background_threads(self: Arc<Self>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::strong_count(&self) == 1,
+            "cannot close Tidehunter while AuthorityPerpetualTables owners remain"
+        );
         let db = self.objects.db.clone();
         drop(self);
-        db.wait_for_tidehunter_background_threads();
+        db.wait_for_tidehunter_background_threads()
     }
 
     // This is used by indexer to find the correct version of dynamic field child object.

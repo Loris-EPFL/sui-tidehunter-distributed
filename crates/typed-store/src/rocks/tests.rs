@@ -954,10 +954,65 @@ async fn test_snapshot_iterator_tidehunter_point_in_time() {
 
 #[cfg(tidehunter)]
 #[tokio::test]
+async fn test_tidehunter_prefixed_keys_across_reads_batches_and_bounds() {
+    use crate::tidehunter_util::{KeyShapeBuilder, KeyType, ThConfig, add_key_space, open};
+
+    let directory = tempfile::tempdir().unwrap();
+    let prefix = vec![7, 8, 9, 10];
+    let mut builder = KeyShapeBuilder::new();
+    let config = ThConfig::new_with_rm_prefix(
+        4,
+        16,
+        KeyType::uniform(1),
+        Default::default(),
+        prefix.clone(),
+    );
+    add_key_space(&mut builder, "prefixed_keys", &config);
+    let metrics = MetricConf::new("test_prefixed_keys");
+    let (inner, registry_id) = open(directory.path(), builder.build(), &metrics);
+    let keyspace = inner.ks("prefixed_keys");
+    let database = Arc::new(Database::new(
+        Storage::TideHunter(inner),
+        metrics,
+        Some(registry_id),
+    ));
+    let db: DBMap<[u8; 8], String> =
+        DBMap::reopen_th(database, "prefixed_keys", keyspace, Some(prefix));
+    let key = |suffix: u8| [7, 8, 9, 10, 0, 0, 0, suffix];
+
+    db.insert(&key(1), &"first".to_owned()).unwrap();
+    db.multi_insert([(key(2), "second".to_owned()), (key(3), "third".to_owned())])
+        .unwrap();
+    assert_eq!(db.get(&key(1)).unwrap(), Some("first".to_owned()));
+    assert!(db.contains_key(&key(2)).unwrap());
+    assert!(!db.contains_key(&key(4)).unwrap());
+    assert_eq!(
+        db.multi_get([key(2), key(3), key(4)]).unwrap(),
+        vec![Some("second".to_owned()), Some("third".to_owned()), None]
+    );
+    assert_eq!(
+        db.snapshot_iterator_with_bounds(Some(key(2)), Some(key(4)), false)
+            .map(Result::unwrap)
+            .collect::<Vec<_>>(),
+        vec![(key(2), "second".to_owned()), (key(3), "third".to_owned())]
+    );
+    db.remove(&key(1)).unwrap();
+    db.multi_remove([key(2)]).unwrap();
+    assert_eq!(db.get(&key(1)).unwrap(), None);
+    assert_eq!(db.get(&key(2)).unwrap(), None);
+    assert_eq!(db.get(&key(3)).unwrap(), Some("third".to_owned()));
+}
+
+#[cfg(tidehunter)]
+#[tokio::test]
 async fn test_open_destroys_undeclared_key_spaces() {
     use crate::tidehunter_util::{KeyShapeBuilder, KeyType, ThConfig, add_key_space, open};
 
-    fn open_db(path: &std::path::Path, db_name: &str, names: &[&str]) -> Arc<tidehunter::db::Db> {
+    fn open_db(
+        path: &std::path::Path,
+        db_name: &str,
+        names: &[&str],
+    ) -> Arc<crate::tidehunter_util::Db> {
         let mut builder = KeyShapeBuilder::new();
         let config = ThConfig::new(8, 16, KeyType::uniform(1));
         for name in names {

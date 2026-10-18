@@ -142,10 +142,9 @@ pub(crate) fn ensure_database_type<P: AsRef<Path>>(
                 storage_type
             );
         }
-        if filepath
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with("wal_"))
-            && storage_type != StorageType::TideHunter
+        if filepath.file_name().is_some_and(|n| {
+            n.to_string_lossy().starts_with("wal_") || n == "tcp-database-authority-v1"
+        }) && storage_type != StorageType::TideHunter
         {
             panic!(
                 "DB type mismatch: expected {:?}, found TideHunter",

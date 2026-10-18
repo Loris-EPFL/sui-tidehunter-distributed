@@ -74,6 +74,8 @@ default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
 testing = []
 distributed-tidehunter-session = ["typed-store/distributed-tidehunter-session"]
+sharded-wal = ["typed-store/sharded-wal", "distributed-tidehunter-session"]
+sharded-wal-fabric = ["sharded-wal", "typed-store/sharded-wal-fabric"]
 
 [dev-dependencies]
 tempfile.workspace = true
