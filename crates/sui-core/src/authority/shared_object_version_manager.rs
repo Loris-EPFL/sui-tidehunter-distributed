@@ -1043,17 +1043,17 @@ mod tests {
                 .build(),
         ];
         let epoch_store = authority.epoch_store_for_testing();
-        let assigned_versions = SharedObjVerManager::assign_versions_from_effects(
-            certs
-                .iter()
-                .zip_debug_eq(effects.iter())
-                .map(|(cert, effect)| (cert, effect, None))
-                .collect::<Vec<_>>()
-                .as_slice(),
-            &epoch_store,
-            authority.get_object_cache_reader().as_ref(),
-        )
-        .unwrap();
+        let assigned_versions = epoch_store
+            .acquire_shared_version_assignments_from_effects(
+                certs
+                    .iter()
+                    .zip_debug_eq(effects.iter())
+                    .map(|(cert, effect)| (cert, effect, None))
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                authority.get_object_cache_reader().as_ref(),
+            )
+            .unwrap();
         // Check that the shared object's next version is always initialized in the epoch store.
         assert_eq!(
             epoch_store
@@ -1113,9 +1113,7 @@ mod tests {
 
         let error = epoch_store
             .acquire_shared_version_assignments_from_effects(
-                &certificate,
-                &effects,
-                None,
+                &[(&certificate, &effects, None)],
                 authority.get_object_cache_reader().as_ref(),
             )
             .unwrap_err();
