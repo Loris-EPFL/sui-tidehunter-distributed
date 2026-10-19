@@ -22,7 +22,7 @@ use sui_types::{
     base_types::{FullObjectRef, SuiAddress, random_object_ref},
     crypto::{AccountKeyPair, deterministic_random_account_key, get_key_pair_from_rng},
     object::{MoveObject, OBJECT_START_VERSION, Owner},
-    storage::RuntimeObjectResolver,
+    storage::{ObjectKey, RuntimeObjectResolver},
 };
 use sui_types::{
     effects::{TestEffectsBuilder, TransactionEffectsAPI},
@@ -502,6 +502,141 @@ impl Scenario {
             .expect("no such object")
             .clone()
     }
+}
+
+#[tokio::test]
+async fn test_object_store_bulk_versions_preserve_order_and_misses() {
+    Scenario::iterate(|mut s| async move {
+        s.with_created(&[1, 2, 3]);
+        let old = s.objects[&s.id_map[&1]].clone();
+        let unchanged = s.objects[&s.id_map[&2]].clone();
+        let deleted = s.objects[&s.id_map[&3]].clone();
+        let tx = s.do_tx().await;
+        s.commit(tx).await.unwrap();
+        s.evict_caches();
+
+        s.with_mutated(&[1]);
+        s.with_deleted(&[3]);
+        let current = s.objects[&s.id_map[&1]].clone();
+        let tx = s.do_tx().await;
+        let keys = [
+            ObjectKey(current.id(), current.version()),
+            ObjectKey(ObjectID::random(), OBJECT_START_VERSION),
+            ObjectKey(old.id(), old.version()),
+            ObjectKey(
+                deleted.id(),
+                SequenceNumber::from_u64(deleted.version().value() + 1),
+            ),
+            ObjectKey(unchanged.id(), unchanged.version()),
+            ObjectKey(current.id(), current.version()),
+        ];
+        let expected = vec![
+            Some(current.clone()),
+            None,
+            Some(old),
+            None,
+            Some(unchanged),
+            Some(current),
+        ];
+        let assert_objects = |cache: &WritebackCache| {
+            let store: &dyn sui_types::storage::ObjectStore = cache;
+            assert!(store.multi_get_objects_by_key(&[]).is_empty());
+            assert_eq!(store.multi_get_objects_by_key(&keys), expected);
+        };
+        // One request combines dirty values/tombstones and historical DB fallback.
+        assert_objects(&s.cache);
+        s.commit(tx).await.unwrap();
+        s.reset_cache();
+        assert_objects(&s.cache);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_unchanged_runtime_bulk_preserves_order_and_missing_sets() {
+    Scenario::iterate(|mut s| async move {
+        let first = ObjectKey(ObjectID::random(), OBJECT_START_VERSION);
+        let second = ObjectKey(ObjectID::random(), SequenceNumber::from_u64(7));
+        s.outputs.unchanged_loaded_runtime_objects = vec![first];
+        let committed = s.do_tx().await;
+        s.commit(committed).await.unwrap();
+        s.evict_caches();
+        s.outputs.unchanged_loaded_runtime_objects = vec![second, first];
+        let dirty = s.do_tx().await;
+        let empty = s.do_tx().await;
+        let digests = [dirty, committed, empty, TransactionDigest::random(), dirty];
+        let expected = vec![
+            vec![second, first],
+            vec![first],
+            vec![],
+            vec![],
+            vec![second, first],
+        ];
+        let assert_objects = |cache: &WritebackCache| {
+            assert!(
+                cache
+                    .multi_get_unchanged_loaded_runtime_objects(&[])
+                    .is_empty()
+            );
+            let results = cache
+                .multi_get_unchanged_loaded_runtime_objects(&digests)
+                .into_iter()
+                .map(Option::unwrap_or_default)
+                .collect::<Vec<_>>();
+            assert_eq!(results, expected);
+        };
+        assert_objects(&s.cache);
+        s.commit(dirty).await.unwrap();
+        s.commit(empty).await.unwrap();
+        s.reset_cache();
+        assert_objects(&s.cache);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_event_fallback_counts_calls_separately_from_keys() {
+    let authority = TestAuthorityBuilder::new().build().await;
+    let metrics = Arc::new(ExecutionCacheMetrics::new(&prometheus::Registry::new()));
+    let cache = WritebackCache::new(
+        &Default::default(),
+        authority.database_for_testing().clone(),
+        metrics.clone(),
+        BackpressureManager::new_for_tests(),
+    );
+    let digest = TransactionDigest::random();
+    assert!(matches!(
+        cache.multi_get_events(&[digest]).as_slice(),
+        [None]
+    ));
+    // The negative cache hit leaves an empty AuthorityStore fallback. It is
+    // still an API call, but must not add another requested database key.
+    assert!(matches!(
+        cache.multi_get_events(&[digest]).as_slice(),
+        [None]
+    ));
+    assert!(cache.multi_get_events(&[]).is_empty());
+    assert_eq!(
+        metrics
+            .db_read_calls
+            .with_label_values(&["transaction_events", "singleton"])
+            .get(),
+        1,
+    );
+    assert_eq!(
+        metrics
+            .db_read_calls
+            .with_label_values(&["transaction_events", "empty"])
+            .get(),
+        2,
+    );
+    assert_eq!(
+        metrics
+            .cache_requests
+            .with_label_values(&["transaction_events", "db"])
+            .get(),
+        1,
+    );
 }
 
 #[tokio::test]

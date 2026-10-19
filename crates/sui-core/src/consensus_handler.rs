@@ -26,7 +26,9 @@ use mysten_metrics::{
 use parking_lot::RwLockWriteGuard;
 use serde::{Deserialize, Serialize};
 use sui_config::node::CongestionLogConfig;
-use sui_macros::{fail_point, fail_point_arg, fail_point_if};
+#[cfg(msim)]
+use sui_macros::fail_point_if;
+use sui_macros::{fail_point, fail_point_arg};
 use sui_protocol_config::{Chain, PerObjectCongestionControlMode, ProtocolConfig};
 use sui_types::{
     authenticator_state::ActiveJwk,
@@ -1294,6 +1296,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
         self.throughput_calculator
             .add_transactions(timestamp, num_schedulables as u64);
 
+        #[cfg(msim)]
         fail_point_if!("correlated-crash-after-consensus-commit-boundary", || {
             let key = [commit_sub_dag_index, epoch];
             if sui_simulator::random::deterministic_probability_once(&key, 0.01) {

@@ -19,7 +19,7 @@ use prometheus::{
     register_int_counter_with_registry,
 };
 use sui_macros::fail_point_arg;
-#[cfg(msim)]
+#[cfg(any(msim, fail_points))]
 use sui_types::base_types::AuthorityName;
 use sui_types::{
     base_types::{ObjectID, ObjectRef},

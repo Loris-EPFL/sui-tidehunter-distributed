@@ -407,6 +407,7 @@ impl PipelineHandle {
         self.cur_stage = self.cur_stage.next();
         if self.cur_stage != PipelineStage::End {
             self.stages.begin(self.cur_stage, self.seq).await;
+            self.timer = Instant::now();
         }
     }
 
@@ -505,6 +506,42 @@ mod test {
         handle
             .finish_stage(PipelineStage::WaitForTransactions)
             .await;
+    }
+
+    #[tokio::test]
+    async fn stage_timer_restarts_after_admission() {
+        let stages = PipelineStages::new(0, CheckpointExecutorMetrics::new_for_tests());
+        let mut handle = stages.handle(0).await;
+        let before = Instant::now();
+        handle.timer = before - Duration::from_secs(3600);
+        handle
+            .finish_stage(PipelineStage::ExecuteTransactions)
+            .await;
+        assert!(handle.timer >= before);
+        let before_second = Instant::now();
+        handle
+            .finish_stage(PipelineStage::WaitForTransactions)
+            .await;
+        assert!(handle.timer >= before_second);
+    }
+
+    #[tokio::test]
+    async fn stage_admission_wait_precedes_timer_reset() {
+        let stages = PipelineStages::new(0, CheckpointExecutorMetrics::new_for_tests());
+        let mut first = stages.handle(0).await;
+        first.finish_stage(PipelineStage::ExecuteTransactions).await;
+        let mut second = stages.handle(1).await;
+        let blocked = tokio::spawn(async move {
+            second
+                .finish_stage(PipelineStage::ExecuteTransactions)
+                .await;
+            second.timer
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        let released = Instant::now();
+        first.finish_stage(PipelineStage::WaitForTransactions).await;
+        assert!(blocked.await.unwrap() >= released);
     }
 
     #[sim_test]

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dashmap::DashMap;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(debug_assertions)]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -2405,25 +2407,20 @@ impl AuthorityPerEpochStore {
         }
     }
 
-    /// Assign a sequence number for the shared objects of the input transaction based on the
-    /// effects of that transaction.
+    /// Assign shared versions from certified effects in input order, initializing the
+    /// deduplicated first-use metadata under the existing per-object locks before execution.
     /// Used by full nodes who don't listen to consensus, and validators who catch up by state sync.
-    // TODO: We should be able to pass in a vector of certs/effects and acquire them all at once.
     #[instrument(level = "trace", skip_all)]
     pub fn acquire_shared_version_assignments_from_effects(
         &self,
-        certificate: &VerifiedExecutableTransaction,
-        effects: &TransactionEffects,
-        accumulator_version: Option<SequenceNumber>,
+        certs_and_effects: &[(
+            &VerifiedExecutableTransaction,
+            &TransactionEffects,
+            Option<SequenceNumber>,
+        )],
         cache_reader: &dyn ObjectCacheRead,
-    ) -> SuiResult<AssignedVersions> {
-        let assigned_versions = SharedObjVerManager::assign_versions_from_effects(
-            &[(certificate, effects, accumulator_version)],
-            self,
-            cache_reader,
-        );
-        let (_, assigned_versions) = assigned_versions.0.into_iter().next().unwrap();
-        Ok(assigned_versions)
+    ) -> SuiResult<AssignedTxAndVersions> {
+        SharedObjVerManager::assign_versions_from_effects(certs_and_effects, self, cache_reader)
     }
 
     pub fn deferred_transactions_empty(&self) -> bool {

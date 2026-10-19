@@ -102,11 +102,20 @@ pub(crate) fn load_checkpoint(
         })
         .collect::<SuiResult<HashMap<_, _>>>()?;
 
+    let tx_digests = ckpt_tx_data
+        .transactions
+        .iter()
+        .map(|tx| *tx.digest())
+        .collect::<Vec<_>>();
+    let unchanged_loaded_runtime_objects =
+        transaction_cache_reader.multi_get_unchanged_loaded_runtime_objects(&tx_digests);
+
     let mut transactions = Vec::with_capacity(ckpt_tx_data.transactions.len());
-    for (tx, fx) in ckpt_tx_data
+    for ((tx, fx), unchanged_loaded_runtime_objects) in ckpt_tx_data
         .transactions
         .iter()
         .zip_debug_eq(ckpt_tx_data.effects.iter())
+        .zip_debug_eq(unchanged_loaded_runtime_objects)
     {
         let events = fx.events_digest().map(|_event_digest| {
             events
@@ -119,11 +128,8 @@ pub(crate) fn load_checkpoint(
             signatures: tx.tx_signatures().to_vec(),
             effects: fx.clone(),
             events,
-            unchanged_loaded_runtime_objects: transaction_cache_reader
-                .get_unchanged_loaded_runtime_objects(tx.digest())
-                // We don't write empty sets to the DB to save space, so if this load went through
-                // the writeback cache to the DB itself it wouldn't find an entry.
-                .unwrap_or_default(),
+            // Empty sets are not persisted, so a missing DB entry means an empty set.
+            unchanged_loaded_runtime_objects: unchanged_loaded_runtime_objects.unwrap_or_default(),
         };
         transactions.push(transaction);
     }
