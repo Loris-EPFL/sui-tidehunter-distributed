@@ -1,0 +1,65 @@
+name: Typed-store Tidehunter correctness
+
+on:
+  push:
+    branches: ["fix/sui-cache-metrics-cardinality"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: typed-store-tidehunter-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+  RUST_TEST_THREADS: "2"
+  USE_TIDEHUNTER: "1"
+  SUI_SKIP_SIMTESTS: "1"
+
+jobs:
+  typed-store:
+    if: github.repository == 'Loris-EPFL/sui-tidehunter-distributed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare native build dependencies
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          timeout 300 sudo -n apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update
+          timeout 600 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
+            build-essential clang libclang-dev pkg-config libssl-dev libfontconfig1-dev \
+            zlib1g-dev python3-venv
+      - name: Prepare pinned CMake and protobuf tools
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/typed-store-tools"
+          "$RUNNER_TEMP/typed-store-tools/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 \
+            cmake==3.31.6 ninja==1.11.1.4 protoc-wheel-0==29.3
+          echo "$RUNNER_TEMP/typed-store-tools/bin" >> "$GITHUB_PATH"
+      - name: Install the repository Rust toolchain
+        timeout-minutes: 16
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          timeout 900 rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+      - name: Check typed-store formatting
+        timeout-minutes: 5
+        run: cargo fmt -p typed-store -- --check
+      - name: Test the pinned native Tidehunter adapter
+        timeout-minutes: 90
+        run: cargo test --locked -p typed-store --features tidehunter --lib

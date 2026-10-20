@@ -270,7 +270,8 @@ impl prometheus::core::Collector for AdapterCollector {
             if let (Some(counters), Some((_, gauges))) =
                 (db.remote_keyspace_cache_counters(), &self.keyspace_cache)
             {
-                for (gauge, stats) in gauges.iter().zip_debug_eq(counters.iter()) {
+                // The fixed counter array also contains undeclared keyspace IDs.
+                for (gauge, stats) in gauges.iter().zip_debug_eq(&counters[..gauges.len()]) {
                     gauge.hits.set(stats.hits.min(i64::MAX as u64) as i64);
                     gauge.misses.set(stats.misses.min(i64::MAX as u64) as i64);
                     gauge.inserts.set(stats.inserts.min(i64::MAX as u64) as i64);
