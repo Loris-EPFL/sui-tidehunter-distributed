@@ -17,7 +17,7 @@ pub struct CheckpointExecutorMetrics {
     pub checkpoint_exec_errors: IntCounter,
     pub checkpoint_exec_epoch: IntGauge,
     pub checkpoint_exec_inflight: IntGauge,
-    pub checkpoint_exec_latency: Histogram,
+    pub checkpoint_completion_latency: Histogram,
     pub checkpoint_prepare_latency: Histogram,
     pub checkpoint_transaction_count: Histogram,
     pub checkpoint_contents_age: Histogram,
@@ -73,9 +73,9 @@ impl CheckpointExecutorMetrics {
                 registry
             )
             .unwrap(),
-            checkpoint_exec_latency: register_histogram_with_registry!(
-                "checkpoint_exec_latency",
-                "Latency of executing a checkpoint from enqueue to all effects available",
+            checkpoint_completion_latency: register_histogram_with_registry!(
+                "checkpoint_completion_latency",
+                "Seconds from synced checkpoint admission through execution, storage commit and publication",
                 mysten_metrics::SUBSECOND_LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             )

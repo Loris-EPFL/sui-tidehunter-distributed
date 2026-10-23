@@ -323,11 +323,12 @@ impl CheckpointExecutor {
         )
         // Checkpoint loading and execution is parallelized
         .map(|checkpoint| {
+            let admitted_at = Instant::now();
             let this = this.clone();
             let pipeline_handle = pipeline_stages.handle(*checkpoint.sequence_number());
             async move {
                 let pipeline_handle = pipeline_handle.await;
-                tokio::spawn(this.execute_checkpoint(checkpoint, pipeline_handle))
+                tokio::spawn(this.execute_checkpoint(checkpoint, pipeline_handle, admitted_at))
                     .await
                     .unwrap()
             }
@@ -358,6 +359,7 @@ impl CheckpointExecutor {
         self: Arc<Self>,
         checkpoint: VerifiedCheckpoint,
         mut pipeline_handle: PipelineHandle,
+        admitted_at: Instant,
     ) -> bool /* is final checkpoint */ {
         info!("executing checkpoint");
         let sequence_number = checkpoint.sequence_number;
@@ -525,6 +527,10 @@ impl CheckpointExecutor {
         finish_stage!(pipeline_handle, BumpHighestExecutedCheckpoint);
 
         // Important: code after the last pipeline stage is finished can run out of checkpoint order.
+
+        self.metrics
+            .checkpoint_completion_latency
+            .observe(admitted_at.elapsed().as_secs_f64());
 
         ckpt_state.data.checkpoint.is_last_checkpoint_of_epoch()
     }
