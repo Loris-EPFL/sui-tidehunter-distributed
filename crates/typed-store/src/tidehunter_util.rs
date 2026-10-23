@@ -186,6 +186,7 @@ struct AdapterCollector {
     db: std::sync::Weak<Db>,
     values: prometheus::IntGaugeVec,
     keyspace_cache: Option<(prometheus::IntGaugeVec, Box<[KeyspaceCacheGauges]>)>,
+    shard_reads: Option<prometheus::IntGaugeVec>,
     io: Option<tidehunter::distributed::remote_db::ReadIoMonitor>,
 }
 impl prometheus::core::Collector for AdapterCollector {
@@ -194,10 +195,14 @@ impl prometheus::core::Collector for AdapterCollector {
         if let Some((keyspace_cache, _)) = &self.keyspace_cache {
             desc.extend(keyspace_cache.desc());
         }
+        if let Some(shards) = &self.shard_reads {
+            desc.extend(shards.desc());
+        }
         desc
     }
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
         use std::sync::atomic::Ordering;
+        let mut shard_sample_available = false;
         if let Some(db) = self.db.upgrade() {
             let set = |name: &str, value: u64| {
                 self.values
@@ -232,6 +237,71 @@ impl prometheus::core::Collector for AdapterCollector {
                 match monitor.sample() {
                     Ok(samples) => {
                         set("shard_sample_available", 1);
+                        shard_sample_available = true;
+                        if let Some(shards) = &self.shard_reads {
+                            for (partition, stats) in &samples {
+                                let partition = partition.to_string();
+                                for (name, value) in [
+                                    ("cache_hits", stats.cache_hits),
+                                    ("cache_misses", stats.cache_misses),
+                                    ("cache_inserts", stats.cache_inserts),
+                                    ("cache_evictions", stats.cache_evictions),
+                                    ("cache_bytes", stats.cache_bytes as u64),
+                                    ("cache_budget", stats.cache_budget as u64),
+                                    ("wal_reads", stats.wal_reads),
+                                    ("wal_read_bytes", stats.wal_read_bytes),
+                                    ("resident_read_attempts", stats.resident_read_attempts),
+                                    ("resident_read_successes", stats.resident_read_successes),
+                                    ("resident_read_fallbacks", stats.resident_read_fallbacks),
+                                    ("resident_read_unsupported", stats.resident_read_unsupported),
+                                    ("resident_read_partial", stats.resident_read_partial),
+                                    ("async_read_submissions", stats.async_read_submissions),
+                                    ("completed_reads", stats.completed_reads),
+                                    ("errors", stats.errors),
+                                    ("cancellations", stats.cancellations),
+                                    ("inflight_requests", stats.inflight_requests as u64),
+                                    ("inflight_bytes", stats.inflight_bytes as u64),
+                                    ("inflight_reads", stats.inflight_reads as u64),
+                                ] {
+                                    shards
+                                        .with_label_values(&[&partition, name])
+                                        .set(value.min(i64::MAX as u64) as i64);
+                                }
+                                #[cfg(feature = "sharded-wal")]
+                                {
+                                    for (name, value) in [
+                                        ("resident_read_deferred", stats.resident_read_deferred),
+                                        (
+                                            "authority_available",
+                                            u64::from(stats.authority.is_some()),
+                                        ),
+                                        ("initiator_available", 0),
+                                    ] {
+                                        shards
+                                            .with_label_values(&[&partition, name])
+                                            .set(value.min(i64::MAX as u64) as i64);
+                                    }
+                                    if let Some(authority) = stats.authority {
+                                        for (name, value) in [
+                                            ("authority_resident_hits", authority.resident_hits),
+                                            (
+                                                "authority_resident_misses",
+                                                authority.resident_misses,
+                                            ),
+                                            ("authority_contention", authority.contention),
+                                            ("authority_history_loads", authority.history_loads),
+                                            ("authority_entries", authority.entries as u64),
+                                            ("authority_capacity", authority.capacity as u64),
+                                            ("authority_table_bytes", authority.table_bytes as u64),
+                                        ] {
+                                            shards
+                                                .with_label_values(&[&partition, name])
+                                                .set(value.min(i64::MAX as u64) as i64);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         set(
                             "shard_cache_hits",
                             samples.iter().map(|(_, s)| s.cache_hits).sum(),
@@ -266,6 +336,49 @@ impl prometheus::core::Collector for AdapterCollector {
                         tracing::warn!(?error, "sharded WAL diagnostic sample unavailable");
                     }
                 }
+                #[cfg(feature = "sharded-wal")]
+                match monitor.sample_resident_reads() {
+                    Ok(samples) => {
+                        set("resident_sample_available", 1);
+                        if let Some(shards) = &self.shard_reads {
+                            for (partition, stats) in samples {
+                                let partition = partition.to_string();
+                                for (name, value) in [
+                                    ("initiator_available", 1),
+                                    ("initiator_eligible_reads", stats.eligible_reads),
+                                    (
+                                        "initiator_message_read_requests",
+                                        stats.message_read_requests,
+                                    ),
+                                    ("initiator_grant_acquisitions", stats.grant_acquisitions),
+                                    ("initiator_rma_posts", stats.rma_posts),
+                                    ("initiator_rma_completions", stats.rma_completions),
+                                    ("initiator_rma_hits", stats.rma_hits),
+                                    ("initiator_rma_errors", stats.rma_errors),
+                                    ("initiator_fallback_missing", stats.fallback_missing),
+                                    ("initiator_fallback_oversize", stats.fallback_oversize),
+                                    ("initiator_fallback_capacity", stats.fallback_capacity),
+                                    ("initiator_fallback_unsupported", stats.fallback_unsupported),
+                                    ("initiator_fallback_stale", stats.fallback_stale),
+                                    ("initiator_handles_live", stats.handles_live),
+                                    (
+                                        "initiator_destination_slots_live",
+                                        stats.destination_slots_live,
+                                    ),
+                                ] {
+                                    shards
+                                        .with_label_values(&[&partition, name])
+                                        .set(value.min(i64::MAX as u64) as i64);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        set("resident_sample_available", 0);
+                        shard_sample_available = false;
+                        tracing::warn!(?error, "resident read diagnostic sample unavailable");
+                    }
+                }
             }
             if let (Some(counters), Some((_, gauges))) =
                 (db.remote_keyspace_cache_counters(), &self.keyspace_cache)
@@ -285,6 +398,10 @@ impl prometheus::core::Collector for AdapterCollector {
         if let Some((keyspace_cache, _)) = &self.keyspace_cache {
             families.extend(keyspace_cache.collect());
         }
+        if let Some(shards) = self.shard_reads.as_ref().filter(|_| shard_sample_available) {
+            // A failed sample omits owner rows instead of exporting old counters.
+            families.extend(shards.collect());
+        }
         families
     }
 }
@@ -301,6 +418,17 @@ fn register_remote_metrics(registry: &Registry, db: &Arc<Db>, path: &Path) {
     )
     .expect("adapter metric definition");
     let io = db.remote_io_monitor();
+    let shard_reads = io.as_ref().map(|_| {
+        prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "tidehunter_shard_read",
+                "Per-owner cumulative read counters and current bounded-cache gauges",
+            )
+            .const_label("namespace", name.clone()),
+            &["partition", "stat"],
+        )
+        .expect("shard read metric definition")
+    });
     let keyspace_cache = io.as_ref().map(|_| {
         let cache = prometheus::IntGaugeVec::new(
             prometheus::Opts::new(
@@ -335,6 +463,7 @@ fn register_remote_metrics(registry: &Registry, db: &Arc<Db>, path: &Path) {
             db: Arc::downgrade(db),
             values,
             keyspace_cache,
+            shard_reads,
             io,
         }))
         .expect("register Tidehunter adapter counters");
