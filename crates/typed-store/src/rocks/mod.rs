@@ -141,10 +141,16 @@ pub struct Database {
     storage: Storage,
     metric_conf: MetricConf,
     registry_id: Option<RegistryID>,
+    #[cfg(tidehunter)]
+    metrics_sampler: Option<crate::tidehunter_util::AdapterMetricsSampler>,
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
+        #[cfg(tidehunter)]
+        if let Some(sampler) = &mut self.metrics_sampler {
+            sampler.stop();
+        }
         let metrics = DBMetrics::get();
         metrics.decrement_num_active_dbs(&self.metric_conf.db_name);
         if let Some(registry_id) = self.registry_id {
@@ -179,7 +185,21 @@ impl Database {
             storage,
             metric_conf,
             registry_id,
+            #[cfg(tidehunter)]
+            metrics_sampler: None,
         }
+    }
+
+    #[cfg(tidehunter)]
+    pub fn new_tidehunter(
+        storage: Storage,
+        metric_conf: MetricConf,
+        registry_id: Option<RegistryID>,
+        metrics_sampler: crate::tidehunter_util::AdapterMetricsSampler,
+    ) -> Self {
+        let mut database = Self::new(storage, metric_conf, registry_id);
+        database.metrics_sampler = Some(metrics_sampler);
+        database
     }
 
     /// Flush all memtables to SST files on disk.
