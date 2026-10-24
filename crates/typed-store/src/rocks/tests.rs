@@ -894,12 +894,14 @@ fn open_th_map(name: &str) -> DBMap<u64, String> {
     add_key_space(&mut builder, name, &config);
     let key_shape = builder.build();
     let metric_conf = MetricConf::new("test_snapshot_iter");
-    let (inner_db, registry_id) = open(temp_dir().as_path(), key_shape, &metric_conf);
+    let (inner_db, registry_id, metrics_sampler) =
+        open(temp_dir().as_path(), key_shape, &metric_conf);
     let ks = inner_db.ks(name);
-    let db = Arc::new(Database::new(
+    let db = Arc::new(Database::new_tidehunter(
         Storage::TideHunter(inner_db.clone()),
         metric_conf,
         Some(registry_id),
+        metrics_sampler,
     ));
     DBMap::reopen_th(db, name, ks, None)
 }
@@ -969,12 +971,13 @@ async fn test_tidehunter_prefixed_keys_across_reads_batches_and_bounds() {
     );
     add_key_space(&mut builder, "prefixed_keys", &config);
     let metrics = MetricConf::new("test_prefixed_keys");
-    let (inner, registry_id) = open(directory.path(), builder.build(), &metrics);
+    let (inner, registry_id, metrics_sampler) = open(directory.path(), builder.build(), &metrics);
     let keyspace = inner.ks("prefixed_keys");
-    let database = Arc::new(Database::new(
+    let database = Arc::new(Database::new_tidehunter(
         Storage::TideHunter(inner),
         metrics,
         Some(registry_id),
+        metrics_sampler,
     ));
     let db: DBMap<[u8; 8], String> =
         DBMap::reopen_th(database, "prefixed_keys", keyspace, Some(prefix));
@@ -1018,7 +1021,8 @@ async fn test_open_destroys_undeclared_key_spaces() {
         for name in names {
             add_key_space(&mut builder, name, &config);
         }
-        let (db, _registry_id) = open(path, builder.build(), &MetricConf::new(db_name));
+        let (db, _registry_id, sampler) = open(path, builder.build(), &MetricConf::new(db_name));
+        drop(sampler);
         db
     }
 

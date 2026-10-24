@@ -379,11 +379,13 @@ pub fn derive_dbmap_utils_general(input: TokenStream) -> TokenStream {
                         );
                     )*
                     let key_shape = builder.build();
-                    let (inner_db, registry_id) = typed_store::tidehunter_util::open(path.as_path(), key_shape, &metric_conf);
-                    let db = std::sync::Arc::new(typed_store::rocks::Database::new(
+                    let (inner_db, registry_id, metrics_sampler) = typed_store::tidehunter_util::open(path.as_path(), key_shape, &metric_conf);
+                    let db = std::sync::Arc::new(typed_store::rocks::Database::new_tidehunter(
                         typed_store::rocks::Storage::TideHunter(inner_db.clone()),
                         metric_conf,
-                        Some(registry_id)));
+                        Some(registry_id),
+                        metrics_sampler,
+                    ));
                     let (
                         #(
                             #field_names

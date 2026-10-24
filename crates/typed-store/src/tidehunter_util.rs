@@ -34,7 +34,11 @@ pub struct ThConfig {
     pub prefix: Option<Vec<u8>>,
 }
 
-pub fn open(path: &Path, key_shape: KeyShape, metric_conf: &MetricConf) -> (Arc<Db>, RegistryID) {
+pub fn open(
+    path: &Path,
+    key_shape: KeyShape,
+    metric_conf: &MetricConf,
+) -> (Arc<Db>, RegistryID, AdapterMetricsSampler) {
     std::fs::create_dir_all(path).expect("failed to open tidehunter db");
     let registry_service = &DBMetrics::get().registry_serivce;
     let registry = new_db_registry(metric_conf.db_name.clone());
@@ -67,11 +71,10 @@ pub fn open(path: &Path, key_shape: KeyShape, metric_conf: &MetricConf) -> (Arc<
         .unwrap_or(0);
     db.set_native_write_profile_limit(native_write_profile_limit);
     export_schema(path, &db);
-    register_remote_metrics(&registry, &db, path);
-    (db, registry_id)
+    let sampler = register_remote_metrics(&registry, &db, path);
+    (db, registry_id, sampler)
 }
 
-#[cfg(feature = "sharded-wal")]
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShardedWalConfig {
@@ -175,6 +178,7 @@ fn export_schema(path: &Path, db: &Db) {
     .expect("export schema manifest");
 }
 
+#[derive(Clone)]
 struct KeyspaceCacheGauges {
     hits: prometheus::IntGauge,
     misses: prometheus::IntGauge,
@@ -182,12 +186,18 @@ struct KeyspaceCacheGauges {
     evictions: prometheus::IntGauge,
 }
 
+#[derive(Clone)]
 struct AdapterCollector {
-    db: std::sync::Weak<Db>,
     values: prometheus::IntGaugeVec,
     keyspace_cache: Option<(prometheus::IntGaugeVec, Box<[KeyspaceCacheGauges]>)>,
+    operational: Option<prometheus::IntGaugeVec>,
     shard_reads: Option<prometheus::IntGaugeVec>,
-    io: Option<tidehunter::distributed::remote_db::ReadIoMonitor>,
+    io: Option<tidehunter::distributed::remote_db::OperationalReadIoMonitor>,
+    local_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    local_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    local_last_success: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    local_stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    metrics_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 impl prometheus::core::Collector for AdapterCollector {
     fn desc(&self) -> Vec<&prometheus::core::Desc> {
@@ -195,217 +205,416 @@ impl prometheus::core::Collector for AdapterCollector {
         if let Some((keyspace_cache, _)) = &self.keyspace_cache {
             desc.extend(keyspace_cache.desc());
         }
+        if let Some(operational) = &self.operational {
+            desc.extend(operational.desc());
+        }
         if let Some(shards) = &self.shard_reads {
             desc.extend(shards.desc());
         }
         desc
     }
+
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
-        use std::sync::atomic::Ordering;
-        let mut shard_sample_available = false;
-        if let Some(db) = self.db.upgrade() {
-            let set = |name: &str, value: u64| {
-                self.values
-                    .with_label_values(&[name])
-                    .set(value.min(i64::MAX as u64) as i64);
-            };
-            set("read_calls", db.read_calls.load(Ordering::Relaxed));
-            set("read_keys", db.read_keys.load(Ordering::Relaxed));
-            set("scan_records", db.scan_records.load(Ordering::Relaxed));
-            db.visit_timing_metrics(set);
-            if let Some((cache, writes, rpcs)) = db.remote_counters() {
-                set("read_rpcs", rpcs);
-                set("cache_hits", cache.hits);
-                set("cache_misses", cache.misses);
-                set("cache_evictions", cache.evictions);
-                set("cache_retained_bytes", cache.retained_bytes as u64);
-                set("cache_budget_bytes", cache.budget_bytes as u64);
-                set("cache_metadata_bytes", cache.metadata_bytes as u64);
-                set(
-                    "cache_per_keyspace_counters_bytes",
-                    cache.per_keyspace_counters_bytes as u64,
-                );
-                set("cache_served_bytes", cache.served_bytes);
-                set("published_batches", writes.published_batches);
-                set("write_validation_ns", writes.validation_ns);
-                set("write_storage_wait_ns", writes.storage_wait_ns);
-                set("write_publication_ns", writes.publication_ns);
-                set("read_index_ns", writes.read_resolve_ns);
-                set("read_wait_ns", writes.value_read_ns);
-            }
-            if let Some(monitor) = &self.io {
-                match monitor.sample() {
-                    Ok(samples) => {
-                        set("shard_sample_available", 1);
-                        shard_sample_available = true;
-                        if let Some(shards) = &self.shard_reads {
-                            for (partition, stats) in &samples {
-                                let partition = partition.to_string();
-                                for (name, value) in [
-                                    ("cache_hits", stats.cache_hits),
-                                    ("cache_misses", stats.cache_misses),
-                                    ("cache_inserts", stats.cache_inserts),
-                                    ("cache_evictions", stats.cache_evictions),
-                                    ("cache_bytes", stats.cache_bytes as u64),
-                                    ("cache_budget", stats.cache_budget as u64),
-                                    ("wal_reads", stats.wal_reads),
-                                    ("wal_read_bytes", stats.wal_read_bytes),
-                                    ("resident_read_attempts", stats.resident_read_attempts),
-                                    ("resident_read_successes", stats.resident_read_successes),
-                                    ("resident_read_fallbacks", stats.resident_read_fallbacks),
-                                    ("resident_read_unsupported", stats.resident_read_unsupported),
-                                    ("resident_read_partial", stats.resident_read_partial),
-                                    ("async_read_submissions", stats.async_read_submissions),
-                                    ("completed_reads", stats.completed_reads),
-                                    ("errors", stats.errors),
-                                    ("cancellations", stats.cancellations),
-                                    ("inflight_requests", stats.inflight_requests as u64),
-                                    ("inflight_bytes", stats.inflight_bytes as u64),
-                                    ("inflight_reads", stats.inflight_reads as u64),
-                                ] {
-                                    shards
-                                        .with_label_values(&[&partition, name])
-                                        .set(value.min(i64::MAX as u64) as i64);
-                                }
-                                #[cfg(feature = "sharded-wal")]
-                                {
-                                    for (name, value) in [
-                                        ("resident_read_deferred", stats.resident_read_deferred),
-                                        (
-                                            "authority_available",
-                                            u64::from(stats.authority.is_some()),
-                                        ),
-                                        ("initiator_available", 0),
-                                    ] {
-                                        shards
-                                            .with_label_values(&[&partition, name])
-                                            .set(value.min(i64::MAX as u64) as i64);
-                                    }
-                                    if let Some(authority) = stats.authority {
-                                        for (name, value) in [
-                                            ("authority_resident_hits", authority.resident_hits),
-                                            (
-                                                "authority_resident_misses",
-                                                authority.resident_misses,
-                                            ),
-                                            ("authority_contention", authority.contention),
-                                            ("authority_history_loads", authority.history_loads),
-                                            ("authority_entries", authority.entries as u64),
-                                            ("authority_capacity", authority.capacity as u64),
-                                            ("authority_table_bytes", authority.table_bytes as u64),
-                                        ] {
-                                            shards
-                                                .with_label_values(&[&partition, name])
-                                                .set(value.min(i64::MAX as u64) as i64);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        set(
-                            "shard_cache_hits",
-                            samples.iter().map(|(_, s)| s.cache_hits).sum(),
-                        );
-                        set(
-                            "shard_cache_misses",
-                            samples.iter().map(|(_, s)| s.cache_misses).sum(),
-                        );
-                        set(
-                            "shard_cache_bytes",
-                            samples.iter().map(|(_, s)| s.cache_bytes as u64).sum(),
-                        );
-                        set(
-                            "shard_wal_reads",
-                            samples.iter().map(|(_, s)| s.wal_reads).sum(),
-                        );
-                        set(
-                            "shard_wal_read_bytes",
-                            samples.iter().map(|(_, s)| s.wal_read_bytes).sum(),
-                        );
-                        set(
-                            "shard_async_read_submissions",
-                            samples.iter().map(|(_, s)| s.async_read_submissions).sum(),
-                        );
-                        set(
-                            "shard_read_errors",
-                            samples.iter().map(|(_, s)| s.errors).sum(),
-                        );
-                    }
-                    Err(error) => {
-                        set("shard_sample_available", 0);
-                        tracing::warn!(?error, "sharded WAL diagnostic sample unavailable");
-                    }
-                }
-                #[cfg(feature = "sharded-wal")]
-                match monitor.sample_resident_reads() {
-                    Ok(samples) => {
-                        set("resident_sample_available", 1);
-                        if let Some(shards) = &self.shard_reads {
-                            for (partition, stats) in samples {
-                                let partition = partition.to_string();
-                                for (name, value) in [
-                                    ("initiator_available", 1),
-                                    ("initiator_eligible_reads", stats.eligible_reads),
-                                    (
-                                        "initiator_message_read_requests",
-                                        stats.message_read_requests,
-                                    ),
-                                    ("initiator_grant_acquisitions", stats.grant_acquisitions),
-                                    ("initiator_rma_posts", stats.rma_posts),
-                                    ("initiator_rma_completions", stats.rma_completions),
-                                    ("initiator_rma_hits", stats.rma_hits),
-                                    ("initiator_rma_errors", stats.rma_errors),
-                                    ("initiator_fallback_missing", stats.fallback_missing),
-                                    ("initiator_fallback_oversize", stats.fallback_oversize),
-                                    ("initiator_fallback_capacity", stats.fallback_capacity),
-                                    ("initiator_fallback_unsupported", stats.fallback_unsupported),
-                                    ("initiator_fallback_stale", stats.fallback_stale),
-                                    ("initiator_handles_live", stats.handles_live),
-                                    (
-                                        "initiator_destination_slots_live",
-                                        stats.destination_slots_live,
-                                    ),
-                                ] {
-                                    shards
-                                        .with_label_values(&[&partition, name])
-                                        .set(value.min(i64::MAX as u64) as i64);
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        set("resident_sample_available", 0);
-                        shard_sample_available = false;
-                        tracing::warn!(?error, "resident read diagnostic sample unavailable");
-                    }
-                }
-            }
-            if let (Some(counters), Some((_, gauges))) =
-                (db.remote_keyspace_cache_counters(), &self.keyspace_cache)
-            {
-                // The fixed counter array also contains undeclared keyspace IDs.
-                for (gauge, stats) in gauges.iter().zip_debug_eq(&counters[..gauges.len()]) {
-                    gauge.hits.set(stats.hits.min(i64::MAX as u64) as i64);
-                    gauge.misses.set(stats.misses.min(i64::MAX as u64) as i64);
-                    gauge.inserts.set(stats.inserts.min(i64::MAX as u64) as i64);
-                    gauge
-                        .evictions
-                        .set(stats.evictions.min(i64::MAX as u64) as i64);
-                }
-            }
-        }
+        let _metrics = self
+            .metrics_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shard_rows_available = self.update_operational_metrics();
+        self.update_local_sample_status();
         let mut families = self.values.collect();
-        if let Some((keyspace_cache, _)) = &self.keyspace_cache {
+        if self
+            .local_available
+            .load(std::sync::atomic::Ordering::Acquire)
+            && let Some((keyspace_cache, _)) = &self.keyspace_cache
+        {
             families.extend(keyspace_cache.collect());
         }
-        if let Some(shards) = self.shard_reads.as_ref().filter(|_| shard_sample_available) {
-            // A failed sample omits owner rows instead of exporting old counters.
+        if let Some(operational) = &self.operational {
+            families.extend(operational.collect());
+        }
+        if shard_rows_available && let Some(shards) = &self.shard_reads {
             families.extend(shards.collect());
         }
         families
     }
 }
-fn register_remote_metrics(registry: &Registry, db: &Arc<Db>, path: &Path) {
+impl AdapterCollector {
+    fn update_local_sample_status(&self) {
+        let stopped = self
+            .local_stopped
+            .load(std::sync::atomic::Ordering::Acquire);
+        let last_success = self
+            .local_last_success
+            .try_lock()
+            .ok()
+            .and_then(|guard| *guard);
+        let fresh = last_success.is_some_and(|attempt| {
+            let age = attempt.elapsed();
+            self.values
+                .with_label_values(&["local_sample_age_ms"])
+                .set(age.as_millis().min(i64::MAX as u128) as i64);
+            age <= std::time::Duration::from_secs(3)
+        });
+        if last_success.is_none() {
+            let _ = self.values.remove_label_values(&["local_sample_age_ms"]);
+        }
+        let available = fresh
+            && self
+                .local_available
+                .load(std::sync::atomic::Ordering::Acquire)
+            && !stopped;
+        self.values
+            .with_label_values(&["local_sample_available"])
+            .set(if available { 1 } else { 0 });
+        self.values
+            .with_label_values(&["local_sampler_stopped"])
+            .set(if stopped { 1 } else { 0 });
+        self.local_available
+            .store(available, std::sync::atomic::Ordering::Release);
+    }
+
+    fn update(&self, db: &Db) -> bool {
+        let _metrics = self
+            .metrics_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.update_locked(db)
+    }
+
+    fn update_locked(&self, db: &Db) -> bool {
+        use std::sync::atomic::Ordering;
+        self.local_available.store(false, Ordering::Release);
+        self.values.reset();
+        let mut set = |name: &str, value: u64| {
+            self.values
+                .with_label_values(&[name])
+                .set(value.min(i64::MAX as u64) as i64);
+        };
+        let generation = self
+            .local_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                Some(generation.saturating_add(1))
+            })
+            .unwrap_or_else(|generation| generation)
+            .saturating_add(1);
+        set("local_sample_generation", generation);
+        set("local_sample_available", 0);
+        set("local_sampler_stopped", 0);
+        set("read_calls", db.read_calls.load(Ordering::Relaxed));
+        set("read_keys", db.read_keys.load(Ordering::Relaxed));
+        set("scan_records", db.scan_records.load(Ordering::Relaxed));
+        if db.try_visit_timing_metrics(&mut set).is_none() {
+            self.invalidate_locked();
+            return false;
+        }
+        let Some(remote_counters) = db.try_remote_counters() else {
+            self.invalidate_locked();
+            return false;
+        };
+        if let Some((cache, writes, rpcs)) = remote_counters {
+            set("read_rpcs", rpcs);
+            set("cache_hits", cache.hits);
+            set("cache_misses", cache.misses);
+            set("cache_evictions", cache.evictions);
+            set("cache_retained_bytes", cache.retained_bytes as u64);
+            set("cache_budget_bytes", cache.budget_bytes as u64);
+            set("cache_metadata_bytes", cache.metadata_bytes as u64);
+            set(
+                "cache_per_keyspace_counters_bytes",
+                cache.per_keyspace_counters_bytes as u64,
+            );
+            set("cache_served_bytes", cache.served_bytes);
+            set("published_batches", writes.published_batches);
+            set("write_validation_ns", writes.validation_ns);
+            set("write_storage_wait_ns", writes.storage_wait_ns);
+            set("write_publication_ns", writes.publication_ns);
+            set("read_index_ns", writes.read_resolve_ns);
+            set("read_wait_ns", writes.value_read_ns);
+        }
+        let Some(keyspace_counters) = db.try_remote_keyspace_cache_counters() else {
+            self.invalidate_locked();
+            return false;
+        };
+        if let (Some(counters), Some((_, gauges))) = (keyspace_counters, &self.keyspace_cache) {
+            // The fixed counter array also contains undeclared keyspace IDs.
+            for (gauge, stats) in gauges.iter().zip_debug_eq(&counters[..gauges.len()]) {
+                gauge.hits.set(stats.hits.min(i64::MAX as u64) as i64);
+                gauge.misses.set(stats.misses.min(i64::MAX as u64) as i64);
+                gauge.inserts.set(stats.inserts.min(i64::MAX as u64) as i64);
+                gauge
+                    .evictions
+                    .set(stats.evictions.min(i64::MAX as u64) as i64);
+            }
+        }
+        let Ok(mut last_success) = self.local_last_success.lock() else {
+            self.invalidate_locked();
+            return false;
+        };
+        *last_success = Some(std::time::Instant::now());
+        drop(last_success);
+        let previous = self.local_generation.load(Ordering::Acquire);
+        set("local_sample_generation", previous);
+        set("local_sample_available", 1);
+        self.local_available.store(true, Ordering::Release);
+        true
+    }
+    fn update_operational_metrics(&self) -> bool {
+        let (Some(monitor), Some(operational), Some(shards)) =
+            (&self.io, &self.operational, &self.shard_reads)
+        else {
+            return false;
+        };
+        operational.reset();
+        shards.reset();
+        let mut resident_sample_available = false;
+        let mut shard_sample_available = false;
+        let set = |name: &str, value: u64| {
+            operational
+                .with_label_values(&[name])
+                .set(value.min(i64::MAX as u64) as i64);
+        };
+        let set_aggregate = |name: &str, value: u64| {
+            self.values
+                .with_label_values(&[name])
+                .set(value.min(i64::MAX as u64) as i64);
+        };
+        if monitor
+            .try_visit(|snapshot, stopped| {
+                set("shard_sampler_stopped", u64::from(stopped));
+                let fresh = snapshot.last_attempt.is_some_and(|attempt| {
+                    set("shard_sample_generation", snapshot.generation);
+                    set("shard_sample_errors", snapshot.failed_samples);
+                    set(
+                        "shard_sample_age_ms",
+                        attempt.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    );
+                    attempt.elapsed() <= std::time::Duration::from_secs(3)
+                });
+                let owner_available = snapshot.available && fresh && !stopped;
+                resident_sample_available = snapshot.resident_available && fresh && !stopped;
+                shard_sample_available = owner_available;
+                if !owner_available || !resident_sample_available {
+                    return;
+                }
+                if let Some(shards) = &self.shard_reads {
+                    for (partition, stats) in &snapshot.owners {
+                        let partition = partition.to_string();
+                        for (name, value) in [
+                            ("cache_hits", stats.cache_hits),
+                            ("cache_misses", stats.cache_misses),
+                            ("cache_inserts", stats.cache_inserts),
+                            ("cache_evictions", stats.cache_evictions),
+                            ("cache_bytes", stats.cache_bytes as u64),
+                            ("cache_budget", stats.cache_budget as u64),
+                            ("wal_reads", stats.wal_reads),
+                            ("wal_read_bytes", stats.wal_read_bytes),
+                            ("resident_read_attempts", stats.resident_read_attempts),
+                            ("resident_read_successes", stats.resident_read_successes),
+                            ("resident_read_fallbacks", stats.resident_read_fallbacks),
+                            ("resident_read_unsupported", stats.resident_read_unsupported),
+                            ("resident_read_partial", stats.resident_read_partial),
+                            ("async_read_submissions", stats.async_read_submissions),
+                            ("completed_reads", stats.completed_reads),
+                            ("errors", stats.errors),
+                            ("cancellations", stats.cancellations),
+                            ("inflight_requests", stats.inflight_requests as u64),
+                            ("inflight_bytes", stats.inflight_bytes as u64),
+                            ("inflight_reads", stats.inflight_reads as u64),
+                        ] {
+                            shards
+                                .with_label_values(&[&partition, name])
+                                .set(value.min(i64::MAX as u64) as i64);
+                        }
+                        #[cfg(feature = "sharded-wal")]
+                        {
+                            for (name, value) in [
+                                ("resident_read_deferred", stats.resident_read_deferred),
+                                ("authority_available", u64::from(stats.authority.is_some())),
+                                ("initiator_available", 0),
+                            ] {
+                                shards
+                                    .with_label_values(&[&partition, name])
+                                    .set(value.min(i64::MAX as u64) as i64);
+                            }
+                            if let Some(authority) = stats.authority {
+                                for (name, value) in [
+                                    ("authority_resident_hits", authority.resident_hits),
+                                    ("authority_resident_misses", authority.resident_misses),
+                                    ("authority_contention", authority.contention),
+                                    ("authority_history_loads", authority.history_loads),
+                                    ("authority_entries", authority.entries as u64),
+                                    ("authority_capacity", authority.capacity as u64),
+                                    ("authority_table_bytes", authority.table_bytes as u64),
+                                ] {
+                                    shards
+                                        .with_label_values(&[&partition, name])
+                                        .set(value.min(i64::MAX as u64) as i64);
+                                }
+                            }
+                        }
+                    }
+                    for (partition, stats) in &snapshot.residents {
+                        let partition = partition.to_string();
+                        for (name, value) in [
+                            ("initiator_available", 1),
+                            ("initiator_eligible_reads", stats.eligible_reads),
+                            (
+                                "initiator_message_read_requests",
+                                stats.message_read_requests,
+                            ),
+                            ("initiator_grant_acquisitions", stats.grant_acquisitions),
+                            ("initiator_rma_posts", stats.rma_posts),
+                            ("initiator_rma_completions", stats.rma_completions),
+                            ("initiator_rma_hits", stats.rma_hits),
+                            ("initiator_rma_errors", stats.rma_errors),
+                            ("initiator_fallback_missing", stats.fallback_missing),
+                            ("initiator_fallback_oversize", stats.fallback_oversize),
+                            ("initiator_fallback_capacity", stats.fallback_capacity),
+                            ("initiator_fallback_unsupported", stats.fallback_unsupported),
+                            ("initiator_fallback_stale", stats.fallback_stale),
+                            ("initiator_handles_live", stats.handles_live),
+                            (
+                                "initiator_destination_slots_live",
+                                stats.destination_slots_live,
+                            ),
+                        ] {
+                            shards
+                                .with_label_values(&[&partition, name])
+                                .set(value.min(i64::MAX as u64) as i64);
+                        }
+                    }
+                }
+                set_aggregate(
+                    "shard_cache_hits",
+                    snapshot.owners.iter().map(|(_, s)| s.cache_hits).sum(),
+                );
+                set_aggregate(
+                    "shard_cache_misses",
+                    snapshot.owners.iter().map(|(_, s)| s.cache_misses).sum(),
+                );
+                set_aggregate(
+                    "shard_cache_bytes",
+                    snapshot
+                        .owners
+                        .iter()
+                        .map(|(_, s)| s.cache_bytes as u64)
+                        .sum(),
+                );
+                set_aggregate(
+                    "shard_wal_reads",
+                    snapshot.owners.iter().map(|(_, s)| s.wal_reads).sum(),
+                );
+                set_aggregate(
+                    "shard_wal_read_bytes",
+                    snapshot.owners.iter().map(|(_, s)| s.wal_read_bytes).sum(),
+                );
+                set_aggregate(
+                    "shard_async_read_submissions",
+                    snapshot
+                        .owners
+                        .iter()
+                        .map(|(_, s)| s.async_read_submissions)
+                        .sum(),
+                );
+                set_aggregate(
+                    "shard_read_errors",
+                    snapshot.owners.iter().map(|(_, s)| s.errors).sum(),
+                );
+            })
+            .is_none()
+        {
+            shard_sample_available = false;
+            resident_sample_available = false;
+        }
+        set("shard_sample_available", u64::from(shard_sample_available));
+        set(
+            "resident_sample_available",
+            u64::from(resident_sample_available),
+        );
+        shard_sample_available && resident_sample_available
+    }
+
+    fn invalidate_locked(&self) {
+        self.local_available
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.values.reset();
+        let generation = self
+            .local_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if generation != 0 {
+            self.values
+                .with_label_values(&["local_sample_generation"])
+                .set(generation.min(i64::MAX as u64) as i64);
+        }
+        self.values
+            .with_label_values(&["local_sample_available"])
+            .set(0);
+        self.values
+            .with_label_values(&["local_sampler_stopped"])
+            .set(0);
+    }
+
+    fn mark_stopped(&self) {
+        self.local_stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _metrics = self
+            .metrics_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.invalidate_locked();
+        self.values
+            .with_label_values(&["local_sampler_stopped"])
+            .set(1);
+    }
+}
+pub struct AdapterMetricsSampler {
+    stop: std::sync::mpsc::SyncSender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    local_stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    metrics_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    values: prometheus::IntGaugeVec,
+}
+impl std::fmt::Debug for AdapterMetricsSampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdapterMetricsSampler")
+            .field("running", &self.worker.is_some())
+            .finish()
+    }
+}
+
+impl AdapterMetricsSampler {
+    pub fn stop(&mut self) {
+        self.local_stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.stop.try_send(());
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("Tidehunter adapter metrics sampler panicked during shutdown");
+        }
+        let _metrics = self
+            .metrics_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.values
+            .with_label_values(&["local_sample_available"])
+            .set(0);
+        self.values
+            .with_label_values(&["local_sampler_stopped"])
+            .set(1);
+    }
+}
+impl Drop for AdapterMetricsSampler {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn register_remote_metrics(
+    registry: &Registry,
+    db: &Arc<Db>,
+    path: &Path,
+) -> AdapterMetricsSampler {
     let root = configured_root();
     let name = root.map_or_else(|| path.display().to_string(), |root| namespace(path, &root));
     let values = prometheus::IntGaugeVec::new(
@@ -417,7 +626,29 @@ fn register_remote_metrics(registry: &Registry, db: &Arc<Db>, path: &Path) {
         &["stat"],
     )
     .expect("adapter metric definition");
-    let io = db.remote_io_monitor();
+    values.with_label_values(&["local_sample_available"]).set(0);
+    values.with_label_values(&["local_sampler_stopped"]).set(0);
+    let sampler_values = values.clone();
+    let io = db.operational_read_io_monitor();
+    let operational = io.as_ref().map(|_| {
+        let metrics = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "tidehunter_operational_read_io",
+                "Freshness and availability of passive operational read-I/O snapshots",
+            )
+            .const_label("namespace", name.clone()),
+            &["stat"],
+        )
+        .expect("operational read-I/O metric definition");
+        for (stat, value) in [
+            ("shard_sample_available", 0),
+            ("resident_sample_available", 0),
+            ("shard_sampler_stopped", 0),
+        ] {
+            metrics.with_label_values(&[stat]).set(value);
+        }
+        metrics
+    });
     let shard_reads = io.as_ref().map(|_| {
         prometheus::IntGaugeVec::new(
             prometheus::Opts::new(
@@ -458,15 +689,73 @@ fn register_remote_metrics(registry: &Registry, db: &Arc<Db>, path: &Path) {
             .into_boxed_slice();
         (cache, gauges)
     });
+    let local_available = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let local_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let local_last_success = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let local_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let metrics_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let collector = AdapterCollector {
+        values,
+        keyspace_cache,
+        operational,
+        shard_reads,
+        io,
+        local_available,
+        local_generation,
+        local_last_success,
+        local_stopped: local_stopped.clone(),
+        metrics_lock: metrics_lock.clone(),
+    };
     registry
-        .register(Box::new(AdapterCollector {
-            db: Arc::downgrade(db),
-            values,
-            keyspace_cache,
-            shard_reads,
-            io,
-        }))
+        .register(Box::new(collector.clone()))
         .expect("register Tidehunter adapter counters");
+
+    let weak_db = Arc::downgrade(db);
+    let (stop, stop_receiver) = std::sync::mpsc::sync_channel(1);
+    let worker_collector = collector.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("tidehunter-metrics".to_owned())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                loop {
+                    if stop_receiver
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .is_ok()
+                    {
+                        worker_collector.mark_stopped();
+                        break;
+                    }
+                    match weak_db.upgrade() {
+                        Some(db) => {
+                            worker_collector.update(&db);
+                        }
+                        None => {
+                            worker_collector.mark_stopped();
+                            break;
+                        }
+                    }
+                }
+            }));
+            if result.is_err() {
+                worker_collector.mark_stopped();
+                tracing::error!("Tidehunter adapter metrics sampler panicked");
+            }
+        });
+    let worker = match spawn_result {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            collector.mark_stopped();
+            tracing::error!(%error, "failed to start Tidehunter adapter metrics sampler");
+            None
+        }
+    };
+    AdapterMetricsSampler {
+        stop,
+        worker,
+        values: sampler_values,
+        local_stopped,
+        metrics_lock,
+    }
 }
 
 /// Destroys key spaces that exist in the database but are no longer declared
@@ -773,4 +1062,67 @@ impl ThConfig {
 
 pub fn default_cells_per_mutex() -> usize {
     1
+}
+
+#[cfg(test)]
+mod adapter_metrics_tests {
+    use super::*;
+
+    fn stat_value(families: &[prometheus::proto::MetricFamily], stat: &str) -> Option<f64> {
+        families
+            .iter()
+            .find(|family| family.name() == "tidehunter_adapter")?
+            .get_metric()
+            .iter()
+            .find(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "stat" && label.value() == stat)
+            })
+            .and_then(|metric| metric.get_gauge().as_ref())
+            .map(|gauge| gauge.value())
+    }
+
+    #[test]
+    fn failed_publication_and_stop_remain_explicitly_unavailable() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::{Arc, Mutex};
+
+        let values = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new("tidehunter_adapter", "test adapter metrics"),
+            &["stat"],
+        )
+        .unwrap();
+        let collector = AdapterCollector {
+            values: values.clone(),
+            keyspace_cache: None,
+            operational: None,
+            shard_reads: None,
+            io: None,
+            local_available: Arc::new(AtomicBool::new(true)),
+            local_generation: Arc::new(AtomicU64::new(4)),
+            local_last_success: Arc::new(Mutex::new(None)),
+            local_stopped: Arc::new(AtomicBool::new(false)),
+            metrics_lock: Arc::new(Mutex::new(())),
+        };
+        values.with_label_values(&["local_sample_available"]).set(1);
+        values.with_label_values(&["read_calls"]).set(99);
+        {
+            let _metrics = collector
+                .metrics_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            collector.invalidate_locked();
+        }
+        let failed = prometheus::core::Collector::collect(&collector);
+        assert_eq!(stat_value(&failed, "local_sample_available"), Some(0.0));
+        assert_eq!(stat_value(&failed, "local_sample_generation"), Some(4.0));
+        assert_eq!(stat_value(&failed, "read_calls"), None);
+
+        collector.mark_stopped();
+        let stopped = prometheus::core::Collector::collect(&collector);
+        assert_eq!(stat_value(&stopped, "local_sample_available"), Some(0.0));
+        assert_eq!(stat_value(&stopped, "local_sampler_stopped"), Some(1.0));
+    }
 }
