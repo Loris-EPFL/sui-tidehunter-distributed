@@ -359,179 +359,155 @@ impl AdapterCollector {
         true
     }
     fn update_operational_metrics(&self) -> bool {
-        let (Some(monitor), Some(operational), Some(shards)) =
-            (&self.io, &self.operational, &self.shard_reads)
+        let (Some(monitor), Some(_), Some(_)) = (&self.io, &self.operational, &self.shard_reads)
         else {
+            return false;
+        };
+        let mut available = false;
+        if monitor
+            .try_visit(|snapshot, stopped| {
+                available = self.publish_operational_snapshot(Some((snapshot, stopped)));
+            })
+            .is_none()
+        {
+            self.publish_operational_snapshot(None);
+        }
+        available
+    }
+
+    fn publish_operational_snapshot(
+        &self,
+        sample: Option<(
+            &tidehunter::distributed::remote_db::OperationalReadIoSnapshot,
+            bool,
+        )>,
+    ) -> bool {
+        let (Some(operational), Some(shards)) = (&self.operational, &self.shard_reads) else {
             return false;
         };
         operational.reset();
         shards.reset();
-        let mut resident_sample_available = false;
-        let mut shard_sample_available = false;
+        for name in [
+            "shard_wal_reads",
+            "shard_wal_read_bytes",
+            "shard_async_read_submissions",
+            "shard_read_errors",
+        ] {
+            let _ = self.values.remove_label_values(&[name]);
+        }
         let set = |name: &str, value: u64| {
             operational
                 .with_label_values(&[name])
                 .set(value.min(i64::MAX as u64) as i64);
         };
-        let set_aggregate = |name: &str, value: u64| {
+        let Some((snapshot, stopped)) = sample else {
+            set("shard_sample_available", 0);
+            return false;
+        };
+        set("shard_sampler_stopped", u64::from(stopped));
+        let fresh = snapshot.last_attempt.is_some_and(|attempt| {
+            let age = attempt.elapsed();
+            set("shard_sample_generation", snapshot.generation);
+            set("shard_sample_errors", snapshot.failed_samples);
+            set(
+                "shard_sample_age_ms",
+                age.as_millis().min(u128::from(u64::MAX)) as u64,
+            );
+            age <= std::time::Duration::from_secs(3)
+        });
+        let available = snapshot.available && fresh && !stopped;
+        set("shard_sample_available", u64::from(available));
+        if !available {
+            return false;
+        }
+        for (partition, stats) in &snapshot.owners {
+            let partition = partition.to_string();
+            for (name, value) in [
+                ("wal_reads", stats.wal_reads),
+                ("wal_read_bytes", stats.wal_read_bytes),
+                ("resident_read_attempts", stats.resident_read_attempts),
+                ("resident_read_successes", stats.resident_read_successes),
+                ("resident_read_fallbacks", stats.resident_read_fallbacks),
+                ("resident_read_unsupported", stats.resident_read_unsupported),
+                ("resident_read_partial", stats.resident_read_partial),
+                ("resident_read_deferred", stats.resident_read_deferred),
+                ("async_read_submissions", stats.async_read_submissions),
+                ("completed_reads", stats.completed_reads),
+                ("errors", stats.errors),
+                ("cancellations", stats.cancellations),
+                ("inflight_requests", stats.inflight_requests as u64),
+                ("inflight_bytes", stats.inflight_bytes as u64),
+                ("inflight_reads", stats.inflight_reads as u64),
+                ("idle_buffer_bytes", stats.idle_buffer_bytes as u64),
+                ("idle_buffers", stats.idle_buffers as u64),
+                ("buffer_reuses", stats.buffer_reuses),
+                ("buffer_allocations", stats.buffer_allocations),
+            ] {
+                shards
+                    .with_label_values(&[&partition, name])
+                    .set(value.min(i64::MAX as u64) as i64);
+            }
+            #[cfg(feature = "sharded-wal")]
+            {
+                shards
+                    .with_label_values(&[&partition, "authority_available"])
+                    .set(i64::from(stats.authority.is_some()));
+                if let Some(authority) = stats.authority {
+                    for (name, value) in [
+                        ("authority_resident_hits", authority.resident_hits),
+                        ("authority_resident_misses", authority.resident_misses),
+                        ("authority_contention", authority.contention),
+                        ("authority_history_loads", authority.history_loads),
+                        ("authority_entries", authority.entries as u64),
+                        ("authority_capacity", authority.capacity as u64),
+                        ("authority_table_bytes", authority.table_bytes as u64),
+                    ] {
+                        shards
+                            .with_label_values(&[&partition, name])
+                            .set(value.min(i64::MAX as u64) as i64);
+                    }
+                }
+            }
+        }
+        for (name, value) in [
+            (
+                "shard_wal_reads",
+                snapshot
+                    .owners
+                    .iter()
+                    .map(|(_, s)| s.wal_reads)
+                    .fold(0, u64::saturating_add),
+            ),
+            (
+                "shard_wal_read_bytes",
+                snapshot
+                    .owners
+                    .iter()
+                    .map(|(_, s)| s.wal_read_bytes)
+                    .fold(0, u64::saturating_add),
+            ),
+            (
+                "shard_async_read_submissions",
+                snapshot
+                    .owners
+                    .iter()
+                    .map(|(_, s)| s.async_read_submissions)
+                    .fold(0, u64::saturating_add),
+            ),
+            (
+                "shard_read_errors",
+                snapshot
+                    .owners
+                    .iter()
+                    .map(|(_, s)| s.errors)
+                    .fold(0, u64::saturating_add),
+            ),
+        ] {
             self.values
                 .with_label_values(&[name])
                 .set(value.min(i64::MAX as u64) as i64);
-        };
-        if monitor
-            .try_visit(|snapshot, stopped| {
-                set("shard_sampler_stopped", u64::from(stopped));
-                let fresh = snapshot.last_attempt.is_some_and(|attempt| {
-                    set("shard_sample_generation", snapshot.generation);
-                    set("shard_sample_errors", snapshot.failed_samples);
-                    set(
-                        "shard_sample_age_ms",
-                        attempt.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                    );
-                    attempt.elapsed() <= std::time::Duration::from_secs(3)
-                });
-                let owner_available = snapshot.available && fresh && !stopped;
-                resident_sample_available = snapshot.resident_available && fresh && !stopped;
-                shard_sample_available = owner_available;
-                if !owner_available || !resident_sample_available {
-                    return;
-                }
-                if let Some(shards) = &self.shard_reads {
-                    for (partition, stats) in &snapshot.owners {
-                        let partition = partition.to_string();
-                        for (name, value) in [
-                            ("cache_hits", stats.cache_hits),
-                            ("cache_misses", stats.cache_misses),
-                            ("cache_inserts", stats.cache_inserts),
-                            ("cache_evictions", stats.cache_evictions),
-                            ("cache_bytes", stats.cache_bytes as u64),
-                            ("cache_budget", stats.cache_budget as u64),
-                            ("wal_reads", stats.wal_reads),
-                            ("wal_read_bytes", stats.wal_read_bytes),
-                            ("resident_read_attempts", stats.resident_read_attempts),
-                            ("resident_read_successes", stats.resident_read_successes),
-                            ("resident_read_fallbacks", stats.resident_read_fallbacks),
-                            ("resident_read_unsupported", stats.resident_read_unsupported),
-                            ("resident_read_partial", stats.resident_read_partial),
-                            ("async_read_submissions", stats.async_read_submissions),
-                            ("completed_reads", stats.completed_reads),
-                            ("errors", stats.errors),
-                            ("cancellations", stats.cancellations),
-                            ("inflight_requests", stats.inflight_requests as u64),
-                            ("inflight_bytes", stats.inflight_bytes as u64),
-                            ("inflight_reads", stats.inflight_reads as u64),
-                        ] {
-                            shards
-                                .with_label_values(&[&partition, name])
-                                .set(value.min(i64::MAX as u64) as i64);
-                        }
-                        #[cfg(feature = "sharded-wal")]
-                        {
-                            for (name, value) in [
-                                ("resident_read_deferred", stats.resident_read_deferred),
-                                ("authority_available", u64::from(stats.authority.is_some())),
-                                ("initiator_available", 0),
-                            ] {
-                                shards
-                                    .with_label_values(&[&partition, name])
-                                    .set(value.min(i64::MAX as u64) as i64);
-                            }
-                            if let Some(authority) = stats.authority {
-                                for (name, value) in [
-                                    ("authority_resident_hits", authority.resident_hits),
-                                    ("authority_resident_misses", authority.resident_misses),
-                                    ("authority_contention", authority.contention),
-                                    ("authority_history_loads", authority.history_loads),
-                                    ("authority_entries", authority.entries as u64),
-                                    ("authority_capacity", authority.capacity as u64),
-                                    ("authority_table_bytes", authority.table_bytes as u64),
-                                ] {
-                                    shards
-                                        .with_label_values(&[&partition, name])
-                                        .set(value.min(i64::MAX as u64) as i64);
-                                }
-                            }
-                        }
-                    }
-                    for (partition, stats) in &snapshot.residents {
-                        let partition = partition.to_string();
-                        for (name, value) in [
-                            ("initiator_available", 1),
-                            ("initiator_eligible_reads", stats.eligible_reads),
-                            (
-                                "initiator_message_read_requests",
-                                stats.message_read_requests,
-                            ),
-                            ("initiator_grant_acquisitions", stats.grant_acquisitions),
-                            ("initiator_rma_posts", stats.rma_posts),
-                            ("initiator_rma_completions", stats.rma_completions),
-                            ("initiator_rma_hits", stats.rma_hits),
-                            ("initiator_rma_errors", stats.rma_errors),
-                            ("initiator_fallback_missing", stats.fallback_missing),
-                            ("initiator_fallback_oversize", stats.fallback_oversize),
-                            ("initiator_fallback_capacity", stats.fallback_capacity),
-                            ("initiator_fallback_unsupported", stats.fallback_unsupported),
-                            ("initiator_fallback_stale", stats.fallback_stale),
-                            ("initiator_handles_live", stats.handles_live),
-                            (
-                                "initiator_destination_slots_live",
-                                stats.destination_slots_live,
-                            ),
-                        ] {
-                            shards
-                                .with_label_values(&[&partition, name])
-                                .set(value.min(i64::MAX as u64) as i64);
-                        }
-                    }
-                }
-                set_aggregate(
-                    "shard_cache_hits",
-                    snapshot.owners.iter().map(|(_, s)| s.cache_hits).sum(),
-                );
-                set_aggregate(
-                    "shard_cache_misses",
-                    snapshot.owners.iter().map(|(_, s)| s.cache_misses).sum(),
-                );
-                set_aggregate(
-                    "shard_cache_bytes",
-                    snapshot
-                        .owners
-                        .iter()
-                        .map(|(_, s)| s.cache_bytes as u64)
-                        .sum(),
-                );
-                set_aggregate(
-                    "shard_wal_reads",
-                    snapshot.owners.iter().map(|(_, s)| s.wal_reads).sum(),
-                );
-                set_aggregate(
-                    "shard_wal_read_bytes",
-                    snapshot.owners.iter().map(|(_, s)| s.wal_read_bytes).sum(),
-                );
-                set_aggregate(
-                    "shard_async_read_submissions",
-                    snapshot
-                        .owners
-                        .iter()
-                        .map(|(_, s)| s.async_read_submissions)
-                        .sum(),
-                );
-                set_aggregate(
-                    "shard_read_errors",
-                    snapshot.owners.iter().map(|(_, s)| s.errors).sum(),
-                );
-            })
-            .is_none()
-        {
-            shard_sample_available = false;
-            resident_sample_available = false;
         }
-        set("shard_sample_available", u64::from(shard_sample_available));
-        set(
-            "resident_sample_available",
-            u64::from(resident_sample_available),
-        );
-        shard_sample_available && resident_sample_available
+        true
     }
 
     fn invalidate_locked(&self) {
@@ -640,11 +616,7 @@ fn register_remote_metrics(
             &["stat"],
         )
         .expect("operational read-I/O metric definition");
-        for (stat, value) in [
-            ("shard_sample_available", 0),
-            ("resident_sample_available", 0),
-            ("shard_sampler_stopped", 0),
-        ] {
+        for (stat, value) in [("shard_sample_available", 0), ("shard_sampler_stopped", 0)] {
             metrics.with_label_values(&[stat]).set(value);
         }
         metrics
@@ -653,7 +625,7 @@ fn register_remote_metrics(
         prometheus::IntGaugeVec::new(
             prometheus::Opts::new(
                 "tidehunter_shard_read",
-                "Per-owner cumulative read counters and current bounded-cache gauges",
+                "Per-owner cumulative read counters and current in-flight gauges",
             )
             .const_label("namespace", name.clone()),
             &["partition", "stat"],
@@ -1102,12 +1074,15 @@ mod adapter_metrics_tests {
             io: None,
             local_available: Arc::new(AtomicBool::new(true)),
             local_generation: Arc::new(AtomicU64::new(4)),
-            local_last_success: Arc::new(Mutex::new(None)),
+            local_last_success: Arc::new(Mutex::new(Some(std::time::Instant::now()))),
             local_stopped: Arc::new(AtomicBool::new(false)),
             metrics_lock: Arc::new(Mutex::new(())),
         };
         values.with_label_values(&["local_sample_available"]).set(1);
         values.with_label_values(&["read_calls"]).set(99);
+        let native = prometheus::core::Collector::collect(&collector);
+        assert_eq!(stat_value(&native, "local_sample_available"), Some(1.0));
+        assert_eq!(stat_value(&native, "read_calls"), Some(99.0));
         {
             let _metrics = collector
                 .metrics_lock
@@ -1124,5 +1099,122 @@ mod adapter_metrics_tests {
         let stopped = prometheus::core::Collector::collect(&collector);
         assert_eq!(stat_value(&stopped, "local_sample_available"), Some(0.0));
         assert_eq!(stat_value(&stopped, "local_sampler_stopped"), Some(1.0));
+    }
+    #[cfg(feature = "sharded-wal")]
+    #[test]
+    fn owner_samples_publish_only_when_fresh_and_available() {
+        use prometheus::core::Collector;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use tidehunter::distributed::remote_db::OperationalReadIoSnapshot;
+        use tidehunter::distributed::tcp::ReadExecutorStats;
+
+        let collector = AdapterCollector {
+            values: prometheus::IntGaugeVec::new(
+                prometheus::Opts::new("tidehunter_adapter", "test"),
+                &["stat"],
+            )
+            .unwrap(),
+            keyspace_cache: None,
+            operational: Some(
+                prometheus::IntGaugeVec::new(
+                    prometheus::Opts::new("tidehunter_operational_read_io", "test"),
+                    &["stat"],
+                )
+                .unwrap(),
+            ),
+            shard_reads: Some(
+                prometheus::IntGaugeVec::new(
+                    prometheus::Opts::new("tidehunter_shard_read", "test"),
+                    &["partition", "stat"],
+                )
+                .unwrap(),
+            ),
+            io: None,
+            local_available: Arc::new(AtomicBool::new(false)),
+            local_generation: Arc::new(AtomicU64::new(0)),
+            local_last_success: Arc::new(Mutex::new(None)),
+            local_stopped: Arc::new(AtomicBool::new(false)),
+            metrics_lock: Arc::new(Mutex::new(())),
+        };
+        let metric = |family: &prometheus::IntGaugeVec, stat: &str| {
+            family
+                .collect()
+                .iter()
+                .flat_map(|f| f.get_metric())
+                .find_map(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "stat" && l.value() == stat)
+                        .then(|| m.get_gauge().as_ref().map(|gauge| gauge.value()))
+                        .flatten()
+                })
+        };
+        let operational = collector.operational.as_ref().unwrap();
+        let shards = collector.shard_reads.as_ref().unwrap();
+        let mut snapshot = OperationalReadIoSnapshot {
+            generation: 7,
+            last_attempt: Some(Instant::now()),
+            available: true,
+            failed_samples: 2,
+            owners: vec![(
+                3,
+                ReadExecutorStats {
+                    wal_reads: 11,
+                    resident_read_deferred: 4,
+                    idle_buffer_bytes: 8192,
+                    idle_buffers: 2,
+                    buffer_reuses: 7,
+                    buffer_allocations: 3,
+                    ..Default::default()
+                },
+            )],
+        };
+
+        assert!(collector.publish_operational_snapshot(Some((&snapshot, false))));
+        assert_eq!(metric(operational, "shard_sample_available"), Some(1.0));
+        assert_eq!(metric(operational, "shard_sample_errors"), Some(2.0));
+        assert_eq!(metric(shards, "wal_reads"), Some(11.0));
+        assert_eq!(metric(shards, "resident_read_deferred"), Some(4.0));
+        assert_eq!(metric(shards, "idle_buffer_bytes"), Some(8192.0));
+        assert_eq!(metric(shards, "idle_buffers"), Some(2.0));
+        assert_eq!(metric(shards, "buffer_reuses"), Some(7.0));
+        assert_eq!(metric(shards, "buffer_allocations"), Some(3.0));
+        assert_eq!(metric(shards, "authority_available"), Some(0.0));
+        assert_eq!(metric(shards, "authority_resident_hits"), None);
+        assert_eq!(metric(&collector.values, "shard_wal_reads"), Some(11.0));
+
+        snapshot.owners[0].1.authority =
+            Some(tidehunter::distributed::storage::AuthorityCacheStats {
+                resident_hits: 9,
+                ..Default::default()
+            });
+        assert!(collector.publish_operational_snapshot(Some((&snapshot, false))));
+        assert_eq!(metric(shards, "authority_available"), Some(1.0));
+        assert_eq!(metric(shards, "authority_resident_hits"), Some(9.0));
+
+        snapshot.available = false;
+        snapshot.failed_samples += 1;
+        assert!(!collector.publish_operational_snapshot(Some((&snapshot, false))));
+        assert_eq!(metric(operational, "shard_sample_available"), Some(0.0));
+        assert_eq!(metric(operational, "shard_sample_errors"), Some(3.0));
+        assert_eq!(metric(shards, "wal_reads"), None);
+        assert_eq!(metric(&collector.values, "shard_wal_reads"), None);
+
+        snapshot.available = true;
+        snapshot.last_attempt = Some(Instant::now() - Duration::from_secs(4));
+        assert!(!collector.publish_operational_snapshot(Some((&snapshot, false))));
+        assert_eq!(metric(operational, "shard_sample_available"), Some(0.0));
+        assert_eq!(metric(shards, "wal_reads"), None);
+
+        snapshot.last_attempt = Some(Instant::now());
+        assert!(!collector.publish_operational_snapshot(Some((&snapshot, true))));
+        assert_eq!(metric(operational, "shard_sampler_stopped"), Some(1.0));
+        assert_eq!(metric(shards, "wal_reads"), None);
+        assert!(!collector.publish_operational_snapshot(None));
+        assert_eq!(metric(operational, "shard_sample_available"), Some(0.0));
+        assert_eq!(metric(operational, "shard_sample_errors"), None);
+        assert_eq!(metric(shards, "wal_reads"), None);
     }
 }
