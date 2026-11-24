@@ -10,9 +10,7 @@ use serde::de::DeserializeOwned;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(not(feature = "sharded-wal"))]
 use tidehunter::compressed_batch::BatchCodec;
-#[cfg(not(feature = "sharded-wal"))]
 use tidehunter::config::Config;
 pub use tidehunter::distributed::sui::Db;
 use tidehunter::distributed::sui::DbIterator;
@@ -75,14 +73,36 @@ pub fn open(
     (db, registry_id, sampler)
 }
 
+#[cfg(feature = "sharded-wal")]
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShardedWalConfig {
     root: std::path::PathBuf,
-    databases: std::collections::BTreeMap<
-        String,
-        tidehunter::distributed::remote_db::RemoteDatabaseConfig,
-    >,
+    databases: std::collections::BTreeMap<String, ShardedDatabaseConfig>,
+}
+
+/// One namespace of `SUI_SHARDED_WAL_CONFIG`, with the presence of its hybrid
+/// index section recorded: a document that states one keeps the operator's
+/// values, and an absent section takes Sui's resolved native index rows.
+#[cfg(feature = "sharded-wal")]
+struct ShardedDatabaseConfig {
+    remote: tidehunter::distributed::remote_db::RemoteDatabaseConfig,
+    index_section: bool,
+}
+
+#[cfg(feature = "sharded-wal")]
+impl<'de> serde::Deserialize<'de> for ShardedDatabaseConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let document = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        let index_section = document.get("index").is_some();
+        // `RemoteDatabaseConfig` keeps `deny_unknown_fields`, so a misspelled
+        // namespace row still fails at parse.
+        let remote = serde_json::from_value(document).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            remote,
+            index_section,
+        })
+    }
 }
 
 #[cfg(feature = "sharded-wal")]
@@ -125,13 +145,20 @@ fn open_backend(
         let config = sharded_config()
             .expect("sharded-wal requires SUI_SHARDED_WAL_CONFIG; native fallback is forbidden");
         let name = namespace(path, &config.root);
-        let remote = config
+        let database = config
             .databases
             .get(&name)
-            .unwrap_or_else(|| panic!("missing exact sharded-wal namespace {name:?}"))
-            .clone();
-        let _ = (metric_conf, metrics);
-        Db::open_remote(path, shape, remote).expect("open sharded-wal Sui database")
+            .unwrap_or_else(|| panic!("missing exact sharded-wal namespace {name:?}"));
+        let remote = if database.index_section {
+            database.remote.clone()
+        } else {
+            // D47: the coordinator's hybrid index runs Sui's resolved native
+            // index rows, the same values the native path gives `Db::open`.
+            let native = thdb_config(metric_conf);
+            database.remote.clone().with_native_index(&native)
+        };
+        Db::open_remote_with_metrics(path, shape, remote, metrics)
+            .expect("open sharded-wal Sui database")
     }
     #[cfg(not(feature = "sharded-wal"))]
     {
@@ -190,9 +217,6 @@ struct KeyspaceCacheGauges {
 struct AdapterCollector {
     values: prometheus::IntGaugeVec,
     keyspace_cache: Option<(prometheus::IntGaugeVec, Box<[KeyspaceCacheGauges]>)>,
-    operational: Option<prometheus::IntGaugeVec>,
-    shard_reads: Option<prometheus::IntGaugeVec>,
-    io: Option<tidehunter::distributed::remote_db::OperationalReadIoMonitor>,
     local_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
     local_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     local_last_success: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
@@ -205,12 +229,6 @@ impl prometheus::core::Collector for AdapterCollector {
         if let Some((keyspace_cache, _)) = &self.keyspace_cache {
             desc.extend(keyspace_cache.desc());
         }
-        if let Some(operational) = &self.operational {
-            desc.extend(operational.desc());
-        }
-        if let Some(shards) = &self.shard_reads {
-            desc.extend(shards.desc());
-        }
         desc
     }
 
@@ -219,7 +237,6 @@ impl prometheus::core::Collector for AdapterCollector {
             .metrics_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let shard_rows_available = self.update_operational_metrics();
         self.update_local_sample_status();
         let mut families = self.values.collect();
         if self
@@ -228,12 +245,6 @@ impl prometheus::core::Collector for AdapterCollector {
             && let Some((keyspace_cache, _)) = &self.keyspace_cache
         {
             families.extend(keyspace_cache.collect());
-        }
-        if let Some(operational) = &self.operational {
-            families.extend(operational.collect());
-        }
-        if shard_rows_available && let Some(shards) = &self.shard_reads {
-            families.extend(shards.collect());
         }
         families
     }
@@ -358,158 +369,6 @@ impl AdapterCollector {
         self.local_available.store(true, Ordering::Release);
         true
     }
-    fn update_operational_metrics(&self) -> bool {
-        let (Some(monitor), Some(_), Some(_)) = (&self.io, &self.operational, &self.shard_reads)
-        else {
-            return false;
-        };
-        let mut available = false;
-        if monitor
-            .try_visit(|snapshot, stopped| {
-                available = self.publish_operational_snapshot(Some((snapshot, stopped)));
-            })
-            .is_none()
-        {
-            self.publish_operational_snapshot(None);
-        }
-        available
-    }
-
-    fn publish_operational_snapshot(
-        &self,
-        sample: Option<(
-            &tidehunter::distributed::remote_db::OperationalReadIoSnapshot,
-            bool,
-        )>,
-    ) -> bool {
-        let (Some(operational), Some(shards)) = (&self.operational, &self.shard_reads) else {
-            return false;
-        };
-        operational.reset();
-        shards.reset();
-        for name in [
-            "shard_wal_reads",
-            "shard_wal_read_bytes",
-            "shard_async_read_submissions",
-            "shard_read_errors",
-        ] {
-            let _ = self.values.remove_label_values(&[name]);
-        }
-        let set = |name: &str, value: u64| {
-            operational
-                .with_label_values(&[name])
-                .set(value.min(i64::MAX as u64) as i64);
-        };
-        let Some((snapshot, stopped)) = sample else {
-            set("shard_sample_available", 0);
-            return false;
-        };
-        set("shard_sampler_stopped", u64::from(stopped));
-        let fresh = snapshot.last_attempt.is_some_and(|attempt| {
-            let age = attempt.elapsed();
-            set("shard_sample_generation", snapshot.generation);
-            set("shard_sample_errors", snapshot.failed_samples);
-            set(
-                "shard_sample_age_ms",
-                age.as_millis().min(u128::from(u64::MAX)) as u64,
-            );
-            age <= std::time::Duration::from_secs(3)
-        });
-        let available = snapshot.available && fresh && !stopped;
-        set("shard_sample_available", u64::from(available));
-        if !available {
-            return false;
-        }
-        for (partition, stats) in &snapshot.owners {
-            let partition = partition.to_string();
-            for (name, value) in [
-                ("wal_reads", stats.wal_reads),
-                ("wal_read_bytes", stats.wal_read_bytes),
-                ("resident_read_attempts", stats.resident_read_attempts),
-                ("resident_read_successes", stats.resident_read_successes),
-                ("resident_read_fallbacks", stats.resident_read_fallbacks),
-                ("resident_read_unsupported", stats.resident_read_unsupported),
-                ("resident_read_partial", stats.resident_read_partial),
-                ("resident_read_deferred", stats.resident_read_deferred),
-                ("async_read_submissions", stats.async_read_submissions),
-                ("completed_reads", stats.completed_reads),
-                ("errors", stats.errors),
-                ("cancellations", stats.cancellations),
-                ("inflight_requests", stats.inflight_requests as u64),
-                ("inflight_bytes", stats.inflight_bytes as u64),
-                ("inflight_reads", stats.inflight_reads as u64),
-                ("idle_buffer_bytes", stats.idle_buffer_bytes as u64),
-                ("idle_buffers", stats.idle_buffers as u64),
-                ("buffer_reuses", stats.buffer_reuses),
-                ("buffer_allocations", stats.buffer_allocations),
-            ] {
-                shards
-                    .with_label_values(&[&partition, name])
-                    .set(value.min(i64::MAX as u64) as i64);
-            }
-            #[cfg(feature = "sharded-wal")]
-            {
-                shards
-                    .with_label_values(&[&partition, "authority_available"])
-                    .set(i64::from(stats.authority.is_some()));
-                if let Some(authority) = stats.authority {
-                    for (name, value) in [
-                        ("authority_resident_hits", authority.resident_hits),
-                        ("authority_resident_misses", authority.resident_misses),
-                        ("authority_contention", authority.contention),
-                        ("authority_history_loads", authority.history_loads),
-                        ("authority_entries", authority.entries as u64),
-                        ("authority_capacity", authority.capacity as u64),
-                        ("authority_table_bytes", authority.table_bytes as u64),
-                    ] {
-                        shards
-                            .with_label_values(&[&partition, name])
-                            .set(value.min(i64::MAX as u64) as i64);
-                    }
-                }
-            }
-        }
-        for (name, value) in [
-            (
-                "shard_wal_reads",
-                snapshot
-                    .owners
-                    .iter()
-                    .map(|(_, s)| s.wal_reads)
-                    .fold(0, u64::saturating_add),
-            ),
-            (
-                "shard_wal_read_bytes",
-                snapshot
-                    .owners
-                    .iter()
-                    .map(|(_, s)| s.wal_read_bytes)
-                    .fold(0, u64::saturating_add),
-            ),
-            (
-                "shard_async_read_submissions",
-                snapshot
-                    .owners
-                    .iter()
-                    .map(|(_, s)| s.async_read_submissions)
-                    .fold(0, u64::saturating_add),
-            ),
-            (
-                "shard_read_errors",
-                snapshot
-                    .owners
-                    .iter()
-                    .map(|(_, s)| s.errors)
-                    .fold(0, u64::saturating_add),
-            ),
-        ] {
-            self.values
-                .with_label_values(&[name])
-                .set(value.min(i64::MAX as u64) as i64);
-        }
-        true
-    }
-
     fn invalidate_locked(&self) {
         self.local_available
             .store(false, std::sync::atomic::Ordering::Release);
@@ -605,34 +464,9 @@ fn register_remote_metrics(
     values.with_label_values(&["local_sample_available"]).set(0);
     values.with_label_values(&["local_sampler_stopped"]).set(0);
     let sampler_values = values.clone();
-    let io = db.operational_read_io_monitor();
-    let operational = io.as_ref().map(|_| {
-        let metrics = prometheus::IntGaugeVec::new(
-            prometheus::Opts::new(
-                "tidehunter_operational_read_io",
-                "Freshness and availability of passive operational read-I/O snapshots",
-            )
-            .const_label("namespace", name.clone()),
-            &["stat"],
-        )
-        .expect("operational read-I/O metric definition");
-        for (stat, value) in [("shard_sample_available", 0), ("shard_sampler_stopped", 0)] {
-            metrics.with_label_values(&[stat]).set(value);
-        }
-        metrics
-    });
-    let shard_reads = io.as_ref().map(|_| {
-        prometheus::IntGaugeVec::new(
-            prometheus::Opts::new(
-                "tidehunter_shard_read",
-                "Per-owner cumulative read counters and current in-flight gauges",
-            )
-            .const_label("namespace", name.clone()),
-            &["partition", "stat"],
-        )
-        .expect("shard read metric definition")
-    });
-    let keyspace_cache = io.as_ref().map(|_| {
+    // The coordinator's per-keyspace read cache exists only on the remote
+    // backend; the native keyspaces report no such counters.
+    let keyspace_cache = db.native().is_none().then(|| {
         let cache = prometheus::IntGaugeVec::new(
             prometheus::Opts::new(
                 "tidehunter_keyspace_read_cache",
@@ -669,9 +503,6 @@ fn register_remote_metrics(
     let collector = AdapterCollector {
         values,
         keyspace_cache,
-        operational,
-        shard_reads,
-        io,
         local_available,
         local_generation,
         local_last_success,
@@ -681,6 +512,14 @@ fn register_remote_metrics(
     registry
         .register(Box::new(collector.clone()))
         .expect("register Tidehunter adapter counters");
+    // The engine registers its own live NVMe-oF counters into the caller's
+    // registry. A failure here costs observability, not storage, so it is
+    // reported and does not fail the open.
+    if db.native().is_none()
+        && let Err(error) = db.register_nvmeof_metrics(registry)
+    {
+        tracing::error!(?error, "failed to register Tidehunter NVMe-oF live metrics");
+    }
 
     let weak_db = Arc::downgrade(db);
     let (stop, stop_receiver) = std::sync::mpsc::sync_channel(1);
@@ -794,7 +633,9 @@ pub fn default_max_dirty_keys() -> usize {
     parse_env_usize("TH_DEFAULT_MAX_DIRTY_KEYS", 1).unwrap_or(1024)
 }
 
-#[cfg(not(feature = "sharded-wal"))]
+/// Sui's resolved native index rows. The native backend hands them to
+/// `Db::open`; the sharded-wal backend hands them to the coordinator hybrid
+/// through [`tidehunter::distributed::remote_db::RemoteDatabaseConfig::with_native_index`].
 fn thdb_config(metric_conf: &MetricConf) -> Config {
     let frag_size = if let Ok(frag_size) = env::var("TH_FRAG_SIZE") {
         let frag_size = frag_size.parse().expect("Failed to parse TH_FRAG_SIZE");
@@ -1069,9 +910,6 @@ mod adapter_metrics_tests {
         let collector = AdapterCollector {
             values: values.clone(),
             keyspace_cache: None,
-            operational: None,
-            shard_reads: None,
-            io: None,
             local_available: Arc::new(AtomicBool::new(true)),
             local_generation: Arc::new(AtomicU64::new(4)),
             local_last_success: Arc::new(Mutex::new(Some(std::time::Instant::now()))),
@@ -1099,122 +937,5 @@ mod adapter_metrics_tests {
         let stopped = prometheus::core::Collector::collect(&collector);
         assert_eq!(stat_value(&stopped, "local_sample_available"), Some(0.0));
         assert_eq!(stat_value(&stopped, "local_sampler_stopped"), Some(1.0));
-    }
-    #[cfg(feature = "sharded-wal")]
-    #[test]
-    fn owner_samples_publish_only_when_fresh_and_available() {
-        use prometheus::core::Collector;
-        use std::sync::atomic::{AtomicBool, AtomicU64};
-        use std::sync::{Arc, Mutex};
-        use std::time::{Duration, Instant};
-        use tidehunter::distributed::remote_db::OperationalReadIoSnapshot;
-        use tidehunter::distributed::tcp::ReadExecutorStats;
-
-        let collector = AdapterCollector {
-            values: prometheus::IntGaugeVec::new(
-                prometheus::Opts::new("tidehunter_adapter", "test"),
-                &["stat"],
-            )
-            .unwrap(),
-            keyspace_cache: None,
-            operational: Some(
-                prometheus::IntGaugeVec::new(
-                    prometheus::Opts::new("tidehunter_operational_read_io", "test"),
-                    &["stat"],
-                )
-                .unwrap(),
-            ),
-            shard_reads: Some(
-                prometheus::IntGaugeVec::new(
-                    prometheus::Opts::new("tidehunter_shard_read", "test"),
-                    &["partition", "stat"],
-                )
-                .unwrap(),
-            ),
-            io: None,
-            local_available: Arc::new(AtomicBool::new(false)),
-            local_generation: Arc::new(AtomicU64::new(0)),
-            local_last_success: Arc::new(Mutex::new(None)),
-            local_stopped: Arc::new(AtomicBool::new(false)),
-            metrics_lock: Arc::new(Mutex::new(())),
-        };
-        let metric = |family: &prometheus::IntGaugeVec, stat: &str| {
-            family
-                .collect()
-                .iter()
-                .flat_map(|f| f.get_metric())
-                .find_map(|m| {
-                    m.get_label()
-                        .iter()
-                        .any(|l| l.name() == "stat" && l.value() == stat)
-                        .then(|| m.get_gauge().as_ref().map(|gauge| gauge.value()))
-                        .flatten()
-                })
-        };
-        let operational = collector.operational.as_ref().unwrap();
-        let shards = collector.shard_reads.as_ref().unwrap();
-        let mut snapshot = OperationalReadIoSnapshot {
-            generation: 7,
-            last_attempt: Some(Instant::now()),
-            available: true,
-            failed_samples: 2,
-            owners: vec![(
-                3,
-                ReadExecutorStats {
-                    wal_reads: 11,
-                    resident_read_deferred: 4,
-                    idle_buffer_bytes: 8192,
-                    idle_buffers: 2,
-                    buffer_reuses: 7,
-                    buffer_allocations: 3,
-                    ..Default::default()
-                },
-            )],
-        };
-
-        assert!(collector.publish_operational_snapshot(Some((&snapshot, false))));
-        assert_eq!(metric(operational, "shard_sample_available"), Some(1.0));
-        assert_eq!(metric(operational, "shard_sample_errors"), Some(2.0));
-        assert_eq!(metric(shards, "wal_reads"), Some(11.0));
-        assert_eq!(metric(shards, "resident_read_deferred"), Some(4.0));
-        assert_eq!(metric(shards, "idle_buffer_bytes"), Some(8192.0));
-        assert_eq!(metric(shards, "idle_buffers"), Some(2.0));
-        assert_eq!(metric(shards, "buffer_reuses"), Some(7.0));
-        assert_eq!(metric(shards, "buffer_allocations"), Some(3.0));
-        assert_eq!(metric(shards, "authority_available"), Some(0.0));
-        assert_eq!(metric(shards, "authority_resident_hits"), None);
-        assert_eq!(metric(&collector.values, "shard_wal_reads"), Some(11.0));
-
-        snapshot.owners[0].1.authority =
-            Some(tidehunter::distributed::storage::AuthorityCacheStats {
-                resident_hits: 9,
-                ..Default::default()
-            });
-        assert!(collector.publish_operational_snapshot(Some((&snapshot, false))));
-        assert_eq!(metric(shards, "authority_available"), Some(1.0));
-        assert_eq!(metric(shards, "authority_resident_hits"), Some(9.0));
-
-        snapshot.available = false;
-        snapshot.failed_samples += 1;
-        assert!(!collector.publish_operational_snapshot(Some((&snapshot, false))));
-        assert_eq!(metric(operational, "shard_sample_available"), Some(0.0));
-        assert_eq!(metric(operational, "shard_sample_errors"), Some(3.0));
-        assert_eq!(metric(shards, "wal_reads"), None);
-        assert_eq!(metric(&collector.values, "shard_wal_reads"), None);
-
-        snapshot.available = true;
-        snapshot.last_attempt = Some(Instant::now() - Duration::from_secs(4));
-        assert!(!collector.publish_operational_snapshot(Some((&snapshot, false))));
-        assert_eq!(metric(operational, "shard_sample_available"), Some(0.0));
-        assert_eq!(metric(shards, "wal_reads"), None);
-
-        snapshot.last_attempt = Some(Instant::now());
-        assert!(!collector.publish_operational_snapshot(Some((&snapshot, true))));
-        assert_eq!(metric(operational, "shard_sampler_stopped"), Some(1.0));
-        assert_eq!(metric(shards, "wal_reads"), None);
-        assert!(!collector.publish_operational_snapshot(None));
-        assert_eq!(metric(operational, "shard_sample_available"), Some(0.0));
-        assert_eq!(metric(operational, "shard_sample_errors"), None);
-        assert_eq!(metric(shards, "wal_reads"), None);
     }
 }
