@@ -124,7 +124,9 @@ use sui_json_rpc_types::{
     SuiObjectDataFilter, SuiTransactionBlockData, SuiTransactionBlockEffects,
     SuiTransactionBlockEvents, TransactionFilter,
 };
-use sui_macros::{fail_point, fail_point_arg, fail_point_async, fail_point_if};
+#[cfg(msim)]
+use sui_macros::fail_point_arg;
+use sui_macros::{fail_point, fail_point_async, fail_point_if};
 use sui_rpc_store::Store as RpcStore;
 use sui_storage::key_value_store::{TransactionKeyValueStore, TransactionKeyValueStoreTrait};
 use sui_storage::key_value_store_metrics::KeyValueStoreMetrics;
@@ -1798,6 +1800,7 @@ impl AuthorityState {
 
         let expected_effects_digest = execution_env.expected_effects_digest;
 
+        #[cfg(msim)]
         fail_point_if!("correlated-crash-process-certificate", || {
             if sui_simulator::random::deterministic_probability_once(certificate.digest(), 0.01) {
                 sui_simulator::task::kill_current_node(None);
@@ -2146,6 +2149,7 @@ impl AuthorityState {
         // the checkpoint-executor path) trips the transaction-fork check. On the builder path
         // (expected_effects_digest is None) the check is skipped, so this still produces a checkpoint
         // fork as before.
+        #[cfg(msim)]
         fail_point_arg!("simulate_fork_during_execution", |(
             forked_validators,
             full_halt,
@@ -2161,7 +2165,6 @@ impl AuthorityState {
             f32,
             bool,
         )| {
-            #[cfg(msim)]
             // When `executor_path_only` is set, fork only while executing a certified checkpoint
             // (expected_effects_digest is set) so the divergence trips the transaction-fork check
             // below; otherwise fork on any path (the builder path yields a checkpoint fork).
