@@ -61,10 +61,12 @@ use crate::{
 
 mod data_ingestion_handler;
 pub mod metrics;
+mod pacing;
 pub(crate) mod utils;
 
 use data_ingestion_handler::{load_checkpoint, store_checkpoint_locally};
 use metrics::CheckpointExecutorMetrics;
+use pacing::CheckpointPacing;
 use utils::*;
 
 const CHECKPOINT_PROGRESS_LOG_COUNT_INTERVAL: u64 = 5000;
@@ -296,6 +298,20 @@ impl CheckpointExecutor {
             self.epoch_store.epoch(),
         );
 
+        // Read the campaign's pacing setting before anything else: a paced arm must refuse
+        // to run unpaced rather than report a pace it did not apply. `start` anchors every
+        // admission deadline of this run.
+        let pacing = CheckpointPacing::from_env(tokio::time::Instant::now())?;
+        self.metrics
+            .checkpoint_exec_pacing_ms
+            .set(i64::try_from(pacing.map_or(0, |pacing| pacing.millis())).unwrap_or(i64::MAX));
+        if let Some(pacing) = pacing {
+            info!(
+                pacing_ms = pacing.millis(),
+                "pacing checkpoint admission; each checkpoint of this run waits one interval"
+            );
+        }
+
         // check if we want to run this epoch based on RunWithRange condition value
         // we want to be inclusive of the defined RunWithRangeEpoch::Epoch
         // i.e Epoch(N) means we will execute epoch N and stop when reaching N+1
@@ -330,8 +346,21 @@ impl CheckpointExecutor {
         .map(|checkpoint| {
             let admitted_at = Instant::now();
             let this = this.clone();
+            // The k-th checkpoint of this run waits until `start + k * interval`. The
+            // index is taken from the run's first checkpoint, not from the absolute
+            // sequence number, so pacing a replayed sub-range stays meaningful.
+            let admission_index = checkpoint.sequence_number.saturating_sub(next_to_schedule);
             let pipeline_handle = pipeline_stages.handle(*checkpoint.sequence_number());
             async move {
+                let admitted_at = match pacing {
+                    Some(pacing) => {
+                        pacing.wait_for_admission(admission_index).await;
+                        // Admission is the end of the deliberate wait, so the completion
+                        // metric still measures execution and publication, not pacing.
+                        Instant::now()
+                    }
+                    None => admitted_at,
+                };
                 let pipeline_handle = pipeline_handle.await;
                 tokio::spawn(this.execute_checkpoint(checkpoint, pipeline_handle, admitted_at))
                     .await
@@ -1298,3 +1327,6 @@ impl CheckpointExecutor {
 
 #[cfg(test)]
 mod assignment_tests;
+
+#[cfg(test)]
+mod pacing_tests;

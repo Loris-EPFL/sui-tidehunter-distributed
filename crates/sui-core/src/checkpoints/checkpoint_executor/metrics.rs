@@ -17,6 +17,8 @@ pub struct CheckpointExecutorMetrics {
     pub checkpoint_exec_errors: IntCounter,
     pub checkpoint_exec_epoch: IntGauge,
     pub checkpoint_exec_inflight: IntGauge,
+    /// Configured checkpoint admission pacing in milliseconds; 0 means unpaced.
+    pub checkpoint_exec_pacing_ms: IntGauge,
     pub checkpoint_completion_latency: Histogram,
     pub checkpoint_prepare_latency: Histogram,
     pub checkpoint_transaction_count: Histogram,
@@ -70,6 +72,12 @@ impl CheckpointExecutorMetrics {
             checkpoint_exec_inflight: register_int_gauge_with_registry!(
                 "checkpoint_exec_inflight",
                 "Current number of inflight checkpoints being executed",
+                registry
+            )
+            .unwrap(),
+            checkpoint_exec_pacing_ms: register_int_gauge_with_registry!(
+                "checkpoint_exec_pacing_ms",
+                "Configured checkpoint admission pacing in milliseconds (0 = unpaced)",
                 registry
             )
             .unwrap(),
