@@ -183,6 +183,15 @@ fn open_backend(
             let native = thdb_config(metric_conf);
             database.remote.clone().with_native_index(&native)
         };
+        // One measurement row must configure both measured nodes identically. The native
+        // arm reads `TH_INDEX_BLOB_CACHE_BYTES` in `thdb_config`, and a document without
+        // an `index` section inherits it through `with_native_index`; a document that
+        // states the section is overridden here, because the row must not depend on
+        // which document an arm runs.
+        let mut remote = remote;
+        if let Some(bytes) = index_blob_cache_bytes() {
+            remote.index.index_blob_cache_bytes = Some(bytes);
+        }
         if let Some(reason) = remote_durability_mismatch(
             remote.live_nvme.leased_durability,
             parse_env_bool("TH_SYNC_WRITES"),
@@ -665,6 +674,33 @@ pub fn default_max_dirty_keys() -> usize {
     parse_env_usize("TH_DEFAULT_MAX_DIRTY_KEYS", 1).unwrap_or(1024)
 }
 
+/// `TH_INDEX_BLOB_CACHE_BYTES` sizes the engine's index blob cache in bytes, the row
+/// upstream Sui never sets (`Config::index_blob_cache_bytes` is `None`, which disables
+/// the cache). One row must configure both measured nodes identically, so the native
+/// database reads it in [`thdb_config`] and the sharded-wal coordinator's hybrid index
+/// reads it in [`open_backend`]. `None` keeps the upstream behaviour; zero is refused
+/// here because the engine's `validate` rejects it, so "off" is spelled by leaving the
+/// row unset.
+fn index_blob_cache_bytes() -> Option<usize> {
+    let raw = env::var("TH_INDEX_BLOB_CACHE_BYTES").ok();
+    parse_index_blob_cache_bytes(raw.as_deref())
+}
+
+/// The pure half of [`index_blob_cache_bytes`], so the row can be tested without
+/// touching the process environment.
+fn parse_index_blob_cache_bytes(raw: Option<&str>) -> Option<usize> {
+    let raw = raw?;
+    let parsed = raw.parse::<usize>().unwrap_or_else(|_| {
+        panic!("Failed to parse TH_INDEX_BLOB_CACHE_BYTES as a byte count: {raw:?}")
+    });
+    assert!(
+        parsed > 0,
+        "TH_INDEX_BLOB_CACHE_BYTES must be non-zero; leave it unset to disable the index blob cache"
+    );
+    println!("Using TH_INDEX_BLOB_CACHE_BYTES from env variable {parsed}");
+    Some(parsed)
+}
+
 /// Sui's resolved native index rows. The native backend hands them to
 /// `Db::open`; the sharded-wal backend hands them to the coordinator hybrid
 /// through [`tidehunter::distributed::remote_db::RemoteDatabaseConfig::with_native_index`].
@@ -730,6 +766,7 @@ fn thdb_config(metric_conf: &MetricConf) -> Config {
         batch_codec,
         compressed_batch_cache_bytes,
         relocation_max_reclaim_pct: 100,
+        index_blob_cache_bytes: index_blob_cache_bytes(),
         ..Config::default()
     };
 
@@ -1048,3 +1085,7 @@ mod campaign_config_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tidehunter_util_tests.rs"]
+mod tidehunter_util_tests;
