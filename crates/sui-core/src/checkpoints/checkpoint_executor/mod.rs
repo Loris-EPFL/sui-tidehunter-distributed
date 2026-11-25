@@ -951,38 +951,66 @@ impl CheckpointExecutor {
                     } else if txn.transaction_data().is_end_of_epoch_tx() {
                         None
                     } else {
-                        let assigned_versions = self
-                            .epoch_store
-                            .acquire_shared_version_assignments_from_effects(
+                        Some((
+                            tx_digest,
+                            (
                                 txn,
                                 effects,
                                 *accumulator_version,
-                                &*self.object_cache_reader,
-                            )
-                            .expect("failed to acquire shared version assignments");
-
-                        let mut env = ExecutionEnv::new()
-                            .with_assigned_versions(assigned_versions)
-                            .with_expected_effects(ExpectedEffectsDigest::Certified {
-                                digest: *expected_fx_digest,
-                                checkpoint_seq: ckpt_state.data.checkpoint.sequence_number,
-                            })
-                            .with_barrier_dependencies(barrier_deps);
-
-                        // Check if the expected effects indicate insufficient balance
-                        if let &ExecutionStatus::Failure(ExecutionFailure {
-                            error: ExecutionErrorKind::InsufficientFundsForWithdraw,
-                            ..
-                        }) = effects.status()
-                        {
-                            env = env.with_insufficient_funds();
-                        }
-
-                        Some((tx_digest, (txn.clone(), env)))
+                                expected_fx_digest,
+                                barrier_deps,
+                            ),
+                        ))
                     }
                 },
             ),
         );
+
+        // Initialize all first-use shared metadata before enqueueing any transaction.
+        // The manager deduplicates the keys and retains the per-object initialization locks.
+        let certs_and_effects = unexecuted_txns
+            .iter()
+            .map(|(txn, effects, version, _, _)| (*txn, *effects, *version))
+            .collect::<Vec<_>>();
+        let assigned_versions = if certs_and_effects.is_empty() {
+            Vec::new()
+        } else {
+            self.epoch_store
+                .acquire_shared_version_assignments_from_effects(
+                    &certs_and_effects,
+                    &*self.object_cache_reader,
+                )
+                .expect("failed to acquire shared version assignments")
+                .0
+        };
+        let unexecuted_txns = unexecuted_txns
+            .into_iter()
+            .zip_debug_eq(assigned_versions)
+            .map(
+                |((txn, effects, _, expected_fx_digest, barrier_deps), (key, versions))| {
+                    assert_eq!(
+                        key,
+                        txn.key(),
+                        "shared version assignments must retain input order"
+                    );
+                    let mut env = ExecutionEnv::new()
+                        .with_assigned_versions(versions)
+                        .with_expected_effects(ExpectedEffectsDigest::Certified {
+                            digest: *expected_fx_digest,
+                            checkpoint_seq: ckpt_state.data.checkpoint.sequence_number,
+                        })
+                        .with_barrier_dependencies(barrier_deps);
+                    if let &ExecutionStatus::Failure(ExecutionFailure {
+                        error: ExecutionErrorKind::InsufficientFundsForWithdraw,
+                        ..
+                    }) = effects.status()
+                    {
+                        env = env.with_insufficient_funds();
+                    }
+                    (txn.clone(), env)
+                },
+            )
+            .collect();
 
         // Enqueue unexecuted transactions with their expected effects digests
         self.execution_scheduler
@@ -1029,12 +1057,15 @@ impl CheckpointExecutor {
         let assigned_versions = self
             .epoch_store
             .acquire_shared_version_assignments_from_effects(
-                change_epoch_tx,
-                change_epoch_fx,
-                None,
+                &[(change_epoch_tx, change_epoch_fx, None)],
                 self.object_cache_reader.as_ref(),
             )
-            .expect("Acquiring shared version assignments for change_epoch tx cannot fail");
+            .expect("Acquiring shared version assignments for change_epoch tx cannot fail")
+            .0
+            .into_iter()
+            .next()
+            .expect("one change epoch assignment")
+            .1;
 
         info!(
             "scheduling change epoch txn with digest: {:?}, expected effects digest: {:?}, assigned versions: {:?}",
@@ -1117,6 +1148,25 @@ impl CheckpointExecutor {
             .update_highest_executed_checkpoint(checkpoint)
             .unwrap();
         self.metrics.last_executed_checkpoint.set(seq as i64);
+        let (cache_hits, cache_misses, backend_gets, busy_bypasses) = self
+            .checkpoint_store
+            .checkpoint_sequence_lookup_cache_counts();
+        self.metrics
+            .checkpoint_sequence_lookup_cache
+            .with_label_values(&["hits"])
+            .set(cache_hits as i64);
+        self.metrics
+            .checkpoint_sequence_lookup_cache
+            .with_label_values(&["misses"])
+            .set(cache_misses as i64);
+        self.metrics
+            .checkpoint_sequence_lookup_cache
+            .with_label_values(&["backend_gets"])
+            .set(backend_gets as i64);
+        self.metrics
+            .checkpoint_sequence_lookup_cache
+            .with_label_values(&["busy_bypasses"])
+            .set(busy_bypasses as i64);
 
         self.metrics
             .last_executed_checkpoint_timestamp_ms

@@ -32,6 +32,7 @@ use mysten_metrics::{MonitoredFutureExt, monitored_scope, spawn_monitored_task};
 use parking_lot::Mutex;
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize};
+#[cfg(msim)]
 use sui_macros::fail_point_arg;
 use sui_network::default_mysten_network_config;
 use sui_types::accumulator_metadata;
@@ -381,6 +382,12 @@ pub struct CheckpointStore {
     // The live node shares one CheckpointStore. This lock orders durable mutations,
     // cache fills and publication; keeping it through the write also orders resets.
     control_cache: Mutex<control_cache::ControlCache>,
+    // Independent short-lock read cache; never held across typed-store work.
+    sequence_read_cache: Mutex<control_cache::SequenceReadCache>,
+    sequence_cache_hits: std::sync::atomic::AtomicU64,
+    sequence_cache_misses: std::sync::atomic::AtomicU64,
+    sequence_backend_gets: std::sync::atomic::AtomicU64,
+    sequence_busy_bypasses: std::sync::atomic::AtomicU64,
     pruner_watermarks: Arc<PrunerWatermarks>,
     synced_checkpoint_notify_read: NotifyRead<CheckpointSequenceNumber, VerifiedCheckpoint>,
     executed_checkpoint_notify_read: NotifyRead<CheckpointSequenceNumber, VerifiedCheckpoint>,
@@ -424,6 +431,11 @@ impl CheckpointStore {
         let store = Arc::new(Self {
             tables,
             control_cache: Mutex::new(cache),
+            sequence_read_cache: Mutex::new(control_cache::SequenceReadCache::default()),
+            sequence_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            sequence_cache_misses: std::sync::atomic::AtomicU64::new(0),
+            sequence_backend_gets: std::sync::atomic::AtomicU64::new(0),
+            sequence_busy_bypasses: std::sync::atomic::AtomicU64::new(0),
             pruner_watermarks,
             synced_checkpoint_notify_read: NotifyRead::new(),
             executed_checkpoint_notify_read: NotifyRead::new(),
@@ -526,8 +538,8 @@ impl CheckpointStore {
     ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
         self.validate_control_cache_read()?;
         self.invalidate_relocated_summaries(cache);
-        if let Some(checkpoint) = cache.summaries.get(digest) {
-            return Ok(Some(checkpoint.clone()));
+        if let Some(checkpoint) = cache.summary(digest) {
+            return Ok(Some(checkpoint));
         }
         let checkpoint = self
             .tables
@@ -547,15 +559,7 @@ impl CheckpointStore {
                 .pruner_watermarks
                 .epoch_id
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let expired: Vec<_> = cache
-                .summaries
-                .iter()
-                .filter(|(_, checkpoint)| checkpoint.epoch() < epoch)
-                .map(|(digest, _)| *digest)
-                .collect();
-            for digest in expired {
-                cache.summaries.pop(&digest);
-            }
+            cache.remove_summaries_older_than_epoch(epoch);
         }
         #[cfg(not(tidehunter))]
         let _ = cache;
@@ -569,7 +573,8 @@ impl CheckpointStore {
         watermarks
             .epoch_id
             .store(epoch, std::sync::atomic::Ordering::Release);
-        cache.summaries.clear();
+        cache.clear_summaries();
+        self.sequence_read_cache.lock().clear();
     }
 
     fn cache_certified_summary(
@@ -586,9 +591,7 @@ impl CheckpointStore {
         {
             return;
         }
-        cache
-            .summaries
-            .put(*checkpoint.digest(), checkpoint.clone());
+        cache.cache_summary(checkpoint);
     }
 
     fn highest_checkpoint(
@@ -616,10 +619,99 @@ impl CheckpointStore {
         &self,
         sequence_number: CheckpointSequenceNumber,
     ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
-        self.tables
-            .certified_checkpoints
-            .get(&sequence_number)
-            .map(|maybe_checkpoint| maybe_checkpoint.map(|c| c.into()))
+        self.get_checkpoint_by_sequence_number_with_loader(sequence_number, || {
+            self.tables
+                .certified_checkpoints
+                .get(&sequence_number)
+                .map(|value| value.map(Into::into))
+        })
+    }
+
+    fn get_checkpoint_by_sequence_number_with_loader(
+        &self,
+        sequence_number: CheckpointSequenceNumber,
+        load: impl FnOnce() -> Result<Option<VerifiedCheckpoint>, TypedStoreError>,
+    ) -> Result<Option<VerifiedCheckpoint>, TypedStoreError> {
+        self.validate_control_cache_read()?;
+        let mut sequence_cache = self.sequence_read_cache.lock();
+        let cached = sequence_cache.get(sequence_number);
+        #[cfg(tidehunter)]
+        let cached = match cached {
+            Some(checkpoint)
+                if checkpoint.epoch()
+                    < self
+                        .pruner_watermarks
+                        .epoch_id
+                        .load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                sequence_cache.invalidate_sequence(sequence_number);
+                None
+            }
+            cached => cached,
+        };
+        drop(sequence_cache);
+        if let Some(checkpoint) = cached {
+            self.validate_control_cache_read()?;
+            self.sequence_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Some(checkpoint));
+        }
+        self.sequence_cache_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let refill_token = self
+            .sequence_read_cache
+            .lock()
+            .begin_refill(sequence_number);
+        if refill_token.is_none() {
+            self.sequence_busy_bypasses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.sequence_backend_gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let backend_result = load();
+        let validation = self.validate_control_cache_read();
+        let checkpoint = backend_result?;
+        validation?;
+
+        #[cfg(tidehunter)]
+        let cacheable = checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.epoch()
+                >= self
+                    .pruner_watermarks
+                    .epoch_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+        });
+        #[cfg(not(tidehunter))]
+        let cacheable = checkpoint.is_some();
+        if let (Some(token), Some(checkpoint)) = (refill_token, checkpoint.as_ref())
+            && cacheable
+            && let Some(bytes) = control_cache::SequenceReadCache::canonical_bytes(checkpoint)
+        {
+            let checkpoint = checkpoint.clone();
+            self.sequence_read_cache.lock().cache_refill(
+                sequence_number,
+                &token,
+                checkpoint,
+                bytes,
+            );
+        }
+        Ok(checkpoint)
+    }
+
+    /// Returns hits, misses, backend gets, and reads that bypass refill during a
+    /// same-sequence durable mutation.
+    pub fn checkpoint_sequence_lookup_cache_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.sequence_cache_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.sequence_cache_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.sequence_backend_gets
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.sequence_busy_bypasses
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     pub fn get_locally_computed_checkpoint(
@@ -870,12 +962,12 @@ impl CheckpointStore {
                 error!("Failed to record checkpoint fork in database: {:?}", e);
             }
 
+            #[cfg(msim)]
             fail_point_arg!(
                 "kill_checkpoint_fork_node",
                 |checkpoint_overrides: std::sync::Arc<
                     std::sync::Mutex<std::collections::BTreeMap<u64, String>>,
                 >| {
-                    #[cfg(msim)]
                     {
                         if let Ok(mut overrides) = checkpoint_overrides.lock() {
                             overrides.insert(
@@ -931,10 +1023,19 @@ impl CheckpointStore {
                 [(&checkpoint.epoch(), checkpoint.sequence_number())],
             )?;
         }
+        let sequence_number = *checkpoint.sequence_number();
+        self.sequence_read_cache
+            .lock()
+            .begin_mutation(sequence_number);
         if let Err(error) = batch.write() {
-            cache.summaries.clear();
+            cache.clear_summaries();
+            self.sequence_read_cache.lock().clear();
             return Err(error);
         }
+        self.sequence_read_cache
+            .lock()
+            .finish_mutation(sequence_number);
+        cache.remove_summary(checkpoint.digest());
         self.cache_certified_summary(&mut cache, checkpoint);
         drop(cache);
 
@@ -1017,14 +1118,13 @@ impl CheckpointStore {
                 if highest < seq {
                     return vec![None];
                 }
-                if highest == seq {
-                    if let Some(checkpoint) = get_highest_checkpoint() {
-                        // A concurrent reset may have changed the watermark since
-                        // the first read; only use a summary for the requested row.
-                        if *checkpoint.sequence_number() == seq {
-                            return vec![Some(checkpoint)];
-                        }
-                    }
+                // A concurrent reset may have changed the watermark since
+                // the first read; only use a summary for the requested row.
+                if highest == seq
+                    && let Some(checkpoint) = get_highest_checkpoint()
+                    && *checkpoint.sequence_number() == seq
+                {
+                    return vec![Some(checkpoint)];
                 }
                 let checkpoint = self
                     .get_checkpoint_by_sequence_number(seq)
@@ -1125,9 +1225,23 @@ impl CheckpointStore {
         checkpoint: &VerifiedCheckpoint,
     ) -> Result<(), TypedStoreError> {
         let value = (*checkpoint.sequence_number(), *checkpoint.digest());
-        cache.persist(watermark, Some(value), || {
+        self.persist_watermark_with(cache, watermark, Some(value), || {
             self.tables.watermarks.insert(&watermark, &value)
         })
+    }
+
+    fn persist_watermark_with(
+        &self,
+        cache: &mut control_cache::ControlCache,
+        watermark: CheckpointWatermark,
+        value: Option<control_cache::StoredWatermark>,
+        write: impl FnOnce() -> Result<(), TypedStoreError>,
+    ) -> Result<(), TypedStoreError> {
+        let result = cache.persist(watermark, value, write);
+        if result.is_err() {
+            self.sequence_read_cache.lock().clear();
+        }
+        result
     }
 
     /// Keeps pruning's digest deletions and pruned-watermark publication in one
@@ -1151,11 +1265,14 @@ impl CheckpointStore {
             &self.tables.watermarks,
             [(CheckpointWatermark::HighestPruned, value)],
         )?;
-        cache.persist(CheckpointWatermark::HighestPruned, Some(value), || {
+        if let Err(error) = cache.persist(CheckpointWatermark::HighestPruned, Some(value), || {
             batch.write()
-        })?;
+        }) {
+            self.sequence_read_cache.lock().clear();
+            return Err(error);
+        }
         for digest in checkpoints {
-            cache.summaries.pop(&digest);
+            cache.remove_summary(&digest);
         }
         Ok(())
     }
@@ -1395,7 +1512,13 @@ impl CheckpointStore {
             &self.tables.watermarks,
             std::iter::once(CheckpointWatermark::HighestExecuted),
         )?;
-        cache.persist(CheckpointWatermark::HighestExecuted, None, || wb.write())?;
+        if let Err(error) = cache.persist(CheckpointWatermark::HighestExecuted, None, || wb.write())
+        {
+            self.sequence_read_cache.lock().clear();
+            return Err(error);
+        }
+        cache.clear_summaries();
+        self.sequence_read_cache.lock().clear();
         Ok(())
     }
 
@@ -2750,6 +2873,7 @@ impl CheckpointSignatureAggregator {
                     format!("{:?} (total stake: {})", digest, total_stake)
                 })
                 .collect::<Vec<String>>();
+            #[cfg(msim)]
             fail_point_arg!("kill_split_brain_node", |(
                 checkpoint_overrides,
                 forked_authorities,
@@ -2757,7 +2881,6 @@ impl CheckpointSignatureAggregator {
                 std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<u64, String>>>,
                 std::sync::Arc<std::sync::Mutex<std::collections::HashSet<AuthorityName>>>,
             )| {
-                #[cfg(msim)]
                 {
                     if let (Ok(mut overrides), Ok(forked_authorities_set)) =
                         (checkpoint_overrides.lock(), forked_authorities.lock())
@@ -3406,12 +3529,19 @@ mod tests {
     }
 
     fn control_cache_checkpoint(sequence: u64) -> VerifiedCheckpoint {
+        control_cache_checkpoint_with_data(sequence, Vec::new())
+    }
+
+    fn control_cache_checkpoint_with_data(
+        sequence: u64,
+        version_specific_data: Vec<u8>,
+    ) -> VerifiedCheckpoint {
         let (committee, keys) =
             sui_types::committee::Committee::new_simple_test_committee_of_size(1);
         let contents = CheckpointContents::new_with_digests_only_for_tests([
             sui_types::base_types::ExecutionDigests::random(),
         ]);
-        let summary = CheckpointSummary::new(
+        let mut summary = CheckpointSummary::new(
             &ProtocolConfig::get_for_max_version_UNSAFE(),
             committee.epoch,
             sequence,
@@ -3424,6 +3554,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
+        summary.version_specific_data = version_specific_data;
         let signed = SignedCheckpointSummary::new(
             committee.epoch,
             summary.clone(),
@@ -3478,8 +3609,30 @@ mod tests {
             store.get_highest_synced_checkpoint_seq_number().unwrap(),
             Some(0)
         );
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(0)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            first.digest()
+        );
+        assert_eq!(store.sequence_read_cache.lock().len(), 1);
         store.reset_db_for_execution_since_genesis().unwrap();
         assert!(store.get_highest_executed_checkpoint().unwrap().is_none());
+        assert_eq!(store.sequence_read_cache.lock().len(), 0);
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(0)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            first.digest()
+        );
+        assert_eq!(
+            store.checkpoint_sequence_lookup_cache_counts(),
+            (0, 2, 2, 0)
+        );
         store.update_highest_executed_checkpoint(&first).unwrap();
         assert_eq!(
             store
@@ -3505,6 +3658,12 @@ mod tests {
                     .set_highest_executed_checkpoint_subtle(&checkpoint)
                     .unwrap();
                 store.update_highest_pruned_checkpoint(&checkpoint).unwrap();
+                #[cfg(tidehunter)]
+                {
+                    let database = store.tables.certified_checkpoints.db.clone();
+                    drop(store);
+                    database.wait_for_tidehunter_background_threads().unwrap();
+                }
             }
             let reopened = if checkpoint_handler {
                 CheckpointStore::new_for_db_checkpoint_handler(directory.path())
@@ -3515,8 +3674,7 @@ mod tests {
                 reopened
                     .control_cache
                     .lock()
-                    .summaries
-                    .contains(checkpoint.digest())
+                    .contains_summary(checkpoint.digest())
             );
             assert_eq!(
                 reopened
@@ -3560,6 +3718,20 @@ mod tests {
         store.insert_certified_checkpoint(&checkpoint).unwrap();
         assert_eq!(
             store
+                .get_checkpoint_by_sequence_number(7)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            checkpoint.digest()
+        );
+        assert!(
+            store
+                .get_checkpoint_by_sequence_number(8)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
                 .get_highest_executed_checkpoint()
                 .unwrap()
                 .unwrap()
@@ -3586,6 +3758,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert!(
+            store
+                .get_checkpoint_by_digest(checkpoint.digest())
+                .unwrap()
+                .is_none()
+        );
         let notified = tokio::time::timeout(
             Duration::from_secs(10),
             store.notify_read_executed_checkpoint(7),
@@ -3598,7 +3776,359 @@ mod tests {
                 .insert_certified_checkpoint(&control_cache_checkpoint(sequence))
                 .unwrap();
         }
-        assert_eq!(store.control_cache.lock().summaries.len(), 8);
+        assert_eq!(store.control_cache.lock().summary_count(), 8);
+        assert!(store.control_cache.lock().summary_bytes() <= 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_sequence_cache_byte_eviction_and_oversize_rejection() {
+        let first = control_cache_checkpoint_with_data(30, vec![0; 400 * 1024]);
+        let second = control_cache_checkpoint_with_data(31, vec![1; 400 * 1024]);
+        let third = control_cache_checkpoint_with_data(32, vec![2; 400 * 1024]);
+        let mut cache = control_cache::ControlCache::default();
+        for checkpoint in [&first, &second, &third] {
+            cache.cache_summary(checkpoint);
+        }
+
+        assert_eq!(cache.summary_count(), 2);
+        assert!(cache.summary_bytes() <= 1024 * 1024);
+        assert!(!cache.contains_summary(first.digest()));
+        assert!(cache.contains_summary(third.digest()));
+
+        let oversized = control_cache_checkpoint_with_data(33, vec![3; 1024 * 1024 + 1]);
+        let mut oversized_cache = control_cache::ControlCache::default();
+        oversized_cache.cache_summary(&oversized);
+        assert_eq!(oversized_cache.summary_count(), 0);
+        assert_eq!(oversized_cache.summary_bytes(), 0);
+        assert!(!oversized_cache.contains_summary(oversized.digest()));
+        let mut read_cache = control_cache::SequenceReadCache::default();
+        for checkpoint in [&first, &second, &third] {
+            let token = read_cache
+                .begin_refill(*checkpoint.sequence_number())
+                .unwrap();
+            let bytes = control_cache::SequenceReadCache::canonical_bytes(checkpoint).unwrap();
+            read_cache.cache_refill(
+                *checkpoint.sequence_number(),
+                &token,
+                checkpoint.clone(),
+                bytes,
+            );
+        }
+        assert_eq!(read_cache.len(), 2);
+        assert!(read_cache.bytes() <= 1024 * 1024);
+        assert!(read_cache.get(30).is_none());
+
+        assert!(control_cache::SequenceReadCache::canonical_bytes(&oversized).is_none());
+        assert_eq!(read_cache.len(), 2);
+        assert!(read_cache.bytes() <= 1024 * 1024);
+    }
+
+    #[test]
+    fn sequence_read_cache_reuses_summaries_within_byte_budget() {
+        const BYTE_LIMIT: usize = 1024 * 1024;
+        let target_bytes = BYTE_LIMIT / 8;
+        let mut cache = control_cache::SequenceReadCache::default();
+        let mut checkpoints = Vec::new();
+        let mut charged_bytes = 0;
+
+        for sequence in 0..u64::try_from(target_bytes).unwrap() {
+            if charged_bytes >= target_bytes {
+                break;
+            }
+            let checkpoint = control_cache_checkpoint(sequence);
+            let bytes = control_cache::SequenceReadCache::canonical_bytes(&checkpoint).unwrap();
+            assert!(bytes > 0);
+            assert!(charged_bytes + bytes <= BYTE_LIMIT);
+            let token = cache.begin_refill(sequence).unwrap();
+            cache.cache_refill(sequence, &token, checkpoint.clone(), bytes);
+            charged_bytes += bytes;
+            checkpoints.push(checkpoint);
+        }
+
+        assert!(charged_bytes >= target_bytes);
+        assert_eq!(cache.bytes(), charged_bytes);
+        assert_eq!(cache.len(), checkpoints.len());
+        for checkpoint in &checkpoints {
+            assert_eq!(
+                cache.get(*checkpoint.sequence_number()).unwrap().digest(),
+                checkpoint.digest()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn test_sequence_cache_refill_tokens_are_key_scoped_and_mutation_fenced() {
+        let checkpoint = control_cache_checkpoint(34);
+        let sequence = *checkpoint.sequence_number();
+        let mut cache = control_cache::SequenceReadCache::default();
+        let stale_token = cache.begin_refill(sequence).unwrap();
+        let _parallel_refill = cache.begin_refill(sequence).unwrap();
+        let bytes = control_cache::SequenceReadCache::canonical_bytes(&checkpoint).unwrap();
+        cache.cache_refill(sequence, &stale_token, checkpoint.clone(), bytes);
+        assert_eq!(cache.get(sequence).unwrap().digest(), checkpoint.digest());
+
+        cache.begin_mutation(sequence);
+        assert!(cache.begin_refill(sequence).is_none());
+        cache.cache_refill(sequence, &stale_token, checkpoint.clone(), bytes);
+        assert_eq!(cache.len(), 0);
+        cache.finish_mutation(sequence);
+
+        let other_sequence = sequence + 1;
+        let other_checkpoint = control_cache_checkpoint(other_sequence);
+        let other_token = cache.begin_refill(other_sequence).unwrap();
+        cache.begin_mutation(sequence);
+        let other_bytes =
+            control_cache::SequenceReadCache::canonical_bytes(&other_checkpoint).unwrap();
+        cache.cache_refill(
+            other_sequence,
+            &other_token,
+            other_checkpoint.clone(),
+            other_bytes,
+        );
+        assert_eq!(
+            cache.get(other_sequence).unwrap().digest(),
+            other_checkpoint.digest()
+        );
+        cache.finish_mutation(sequence);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_read_cache_survives_unrelated_producer_inserts() {
+        let (_directory, store) = control_cache_store();
+        let checkpoint = control_cache_checkpoint(100);
+        store.insert_certified_checkpoint(&checkpoint).unwrap();
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(100)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            checkpoint.digest()
+        );
+
+        for sequence in 101..=125 {
+            store
+                .insert_certified_checkpoint(&control_cache_checkpoint(sequence))
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(100)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            checkpoint.digest()
+        );
+        assert_eq!(
+            store.checkpoint_sequence_lookup_cache_counts(),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(store.sequence_read_cache.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_sequence_cache_observes_overwrite() {
+        let (_directory, store) = control_cache_store();
+        let original = control_cache_checkpoint(12);
+        let replacement = control_cache_checkpoint(12);
+        store.insert_certified_checkpoint(&original).unwrap();
+        store.insert_certified_checkpoint(&replacement).unwrap();
+        assert_ne!(original.digest(), replacement.digest());
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(12)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            replacement.digest()
+        );
+        assert_eq!(
+            store
+                .get_checkpoint_by_digest(original.digest())
+                .unwrap()
+                .unwrap()
+                .digest(),
+            original.digest()
+        );
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(12)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            replacement.digest()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequence_lookup_does_not_refill_overwritten_checkpoint() {
+        let (_directory, store) = control_cache_store();
+        let old = control_cache_checkpoint(40);
+        let replacement = control_cache_checkpoint(40);
+        store.insert_certified_checkpoint(&old).unwrap();
+        store.control_cache.lock().clear_summaries();
+
+        let loader_started = Arc::new(std::sync::Barrier::new(2));
+        let allow_loader_return = Arc::new(std::sync::Barrier::new(2));
+        let worker_store = store.clone();
+        let worker_started = loader_started.clone();
+        let worker_return = allow_loader_return.clone();
+        let worker_old = old.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store
+                .get_checkpoint_by_sequence_number_with_loader(40, || {
+                    worker_started.wait();
+                    worker_return.wait();
+                    Ok(Some(worker_old))
+                })
+                .unwrap()
+                .unwrap()
+        });
+
+        loader_started.wait();
+        store.insert_certified_checkpoint(&replacement).unwrap();
+        allow_loader_return.wait();
+        assert_eq!(worker.join().unwrap().digest(), old.digest());
+        assert_eq!(store.sequence_read_cache.lock().len(), 0);
+        assert_eq!(store.control_cache.lock().summary_count(), 1);
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(40)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            replacement.digest()
+        );
+        assert_eq!(store.sequence_read_cache.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_lookup_does_not_refill_pruned_digest() {
+        let (_directory, store) = control_cache_store();
+        let checkpoint = control_cache_checkpoint(41);
+        store.insert_certified_checkpoint(&checkpoint).unwrap();
+        store.control_cache.lock().clear_summaries();
+
+        let loader_started = Arc::new(std::sync::Barrier::new(2));
+        let allow_loader_return = Arc::new(std::sync::Barrier::new(2));
+        let worker_store = store.clone();
+        let worker_started = loader_started.clone();
+        let worker_return = allow_loader_return.clone();
+        let worker_checkpoint = checkpoint.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store
+                .get_checkpoint_by_sequence_number_with_loader(41, || {
+                    worker_started.wait();
+                    worker_return.wait();
+                    Ok(Some(worker_checkpoint))
+                })
+                .unwrap()
+                .unwrap()
+        });
+
+        loader_started.wait();
+        store
+            .prune_checkpoint_data(41, vec![*checkpoint.digest()], vec![])
+            .unwrap();
+        allow_loader_return.wait();
+        assert_eq!(worker.join().unwrap().digest(), checkpoint.digest());
+        assert_eq!(store.control_cache.lock().summary_count(), 0);
+        assert!(
+            store
+                .get_checkpoint_by_digest(checkpoint.digest())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(41)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            checkpoint.digest()
+        );
+        assert_eq!(
+            store.checkpoint_sequence_lookup_cache_counts(),
+            (1, 1, 1, 0)
+        );
+        assert!(
+            store
+                .get_checkpoint_by_digest(checkpoint.digest())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_sequence_lookup_does_not_wait_for_control_cache() {
+        let (_directory, store) = control_cache_store();
+        let checkpoint = control_cache_checkpoint(14);
+        store.insert_certified_checkpoint(&checkpoint).unwrap();
+
+        assert_eq!(
+            store
+                .get_checkpoint_by_sequence_number(14)
+                .unwrap()
+                .unwrap()
+                .digest(),
+            checkpoint.digest()
+        );
+        let cache_guard = store.control_cache.lock();
+        let worker_store = store.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_store
+                .get_checkpoint_by_sequence_number(14)
+                .ok()
+                .flatten()
+                .map(|checkpoint| *checkpoint.digest());
+            sender.send(result).unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        drop(cache_guard);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), Some(*checkpoint.digest()));
+        assert_eq!(
+            store.checkpoint_sequence_lookup_cache_counts(),
+            (1, 1, 1, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_control_write_failure_clears_summary_cache() {
+        let (_directory, store) = control_cache_store();
+        let checkpoint = control_cache_checkpoint(42);
+        store.insert_certified_checkpoint(&checkpoint).unwrap();
+        store
+            .get_checkpoint_by_sequence_number(*checkpoint.sequence_number())
+            .unwrap();
+        assert_eq!(store.sequence_read_cache.lock().len(), 1);
+        {
+            let mut cache = store.control_cache.lock();
+            assert!(cache.contains_summary(checkpoint.digest()));
+            assert!(
+                store
+                    .persist_watermark_with(
+                        &mut cache,
+                        CheckpointWatermark::HighestSynced,
+                        Some((*checkpoint.sequence_number(), *checkpoint.digest())),
+                        || Err(TypedStoreError::SerializationError(
+                            "injected durable failure".to_owned(),
+                        )),
+                    )
+                    .is_err()
+            );
+            assert_eq!(cache.summary_count(), 0);
+            assert_eq!(store.sequence_read_cache.lock().len(), 0);
+        }
+        assert_eq!(
+            store
+                .get_checkpoint_by_digest(checkpoint.digest())
+                .unwrap()
+                .unwrap()
+                .digest(),
+            checkpoint.digest()
+        );
     }
 
     #[tokio::test]
@@ -3655,22 +4185,29 @@ mod tests {
             store
                 .control_cache
                 .lock()
-                .summaries
-                .contains(checkpoint.digest())
+                .contains_summary(checkpoint.digest())
         );
+        store.get_checkpoint_by_sequence_number(1).unwrap().unwrap();
+        assert_eq!(store.sequence_read_cache.lock().len(), 1);
         store
             .pruner_watermarks
             .epoch_id
             .store(1, std::sync::atomic::Ordering::Relaxed);
         // Relocation may not yet have removed the durable row, but an eligible
         // old summary must be checked in storage on each read.
+        assert!(
+            store
+                .get_checkpoint_by_sequence_number(1)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.sequence_read_cache.lock().len(), 0);
         store.get_highest_verified_checkpoint().unwrap();
         assert!(
             !store
                 .control_cache
                 .lock()
-                .summaries
-                .contains(checkpoint.digest())
+                .contains_summary(checkpoint.digest())
         );
     }
 
