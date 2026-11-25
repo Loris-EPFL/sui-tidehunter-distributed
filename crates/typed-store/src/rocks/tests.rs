@@ -885,7 +885,9 @@ async fn test_safe_iter_returns_error_on_deserialization_failure() {
     );
 }
 
-#[cfg(tidehunter)]
+// The native open path; the sharded-wal feature forbids it, so these
+// native-path tests only compile and run without it.
+#[cfg(all(tidehunter, not(feature = "sharded-wal")))]
 fn open_th_map(name: &str) -> DBMap<u64, String> {
     use crate::tidehunter_util::{KeyShapeBuilder, KeyType, ThConfig, add_key_space, open};
     let mut builder = KeyShapeBuilder::new();
@@ -906,7 +908,7 @@ fn open_th_map(name: &str) -> DBMap<u64, String> {
     DBMap::reopen_th(db, name, ks, None)
 }
 
-#[cfg(tidehunter)]
+#[cfg(all(tidehunter, not(feature = "sharded-wal")))]
 #[tokio::test]
 async fn test_snapshot_iterator_tidehunter_point_in_time() {
     let db = open_th_map("snapshot_iter");
@@ -954,7 +956,7 @@ async fn test_snapshot_iterator_tidehunter_point_in_time() {
     assert_eq!(reversed, vec![(3, "c".to_string()), (1, "A".to_string())]);
 }
 
-#[cfg(tidehunter)]
+#[cfg(all(tidehunter, not(feature = "sharded-wal")))]
 #[tokio::test]
 async fn test_tidehunter_prefixed_keys_across_reads_batches_and_bounds() {
     use crate::tidehunter_util::{KeyShapeBuilder, KeyType, ThConfig, add_key_space, open};
@@ -1006,7 +1008,7 @@ async fn test_tidehunter_prefixed_keys_across_reads_batches_and_bounds() {
     assert_eq!(db.get(&key(3)).unwrap(), Some("third".to_owned()));
 }
 
-#[cfg(tidehunter)]
+#[cfg(all(tidehunter, not(feature = "sharded-wal")))]
 #[tokio::test]
 async fn test_open_destroys_undeclared_key_spaces() {
     use crate::tidehunter_util::{KeyShapeBuilder, KeyType, ThConfig, add_key_space, open};

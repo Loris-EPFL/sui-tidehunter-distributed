@@ -249,6 +249,7 @@ impl CheckpointStoreTables {
         use typed_store::tidehunter_util::{
             Decision, KeySpaceConfig, KeyType, ThConfig, default_cells_per_mutex,
             default_max_dirty_keys, default_mutex_count, default_value_cache_size,
+            value_cache_size_override,
         };
         let mutexes = default_mutex_count();
         let u64_sequence_key = KeyType::from_prefix_bits(6 * 8);
@@ -269,9 +270,10 @@ impl CheckpointStoreTables {
             vec![0, 0, 0, 0, 0, 0, 0, 32],
         );
         let watermarks_config = KeySpaceConfig::new()
-            .with_value_cache_size(10)
+            .with_value_cache_size(value_cache_size_override(10))
             .disable_unload();
-        let lru_config = KeySpaceConfig::new().with_value_cache_size(100);
+        let lru_config =
+            KeySpaceConfig::new().with_value_cache_size(value_cache_size_override(100));
         let configs = vec![
             (
                 "checkpoint_content",
