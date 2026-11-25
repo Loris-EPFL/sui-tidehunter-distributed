@@ -371,12 +371,29 @@ fn acquire_shared_versions<T, A, F>(items: &[T], mut acquire: F) -> SuiResult<Ve
 where
     F: FnMut(&[T]) -> SuiResult<Vec<A>>,
 {
+    if items.is_empty() {
+        // An empty checkpoint has nothing to initialise and must not pay a store read.
+        return Ok(Vec::new());
+    }
+    if items.len() <= SHARED_VERSION_BATCH_KEYS {
+        // The common checkpoint fits one request: hand the manager's vector back
+        // unchanged, so the usual path keeps its single allocation and no copies.
+        return acquire(items);
+    }
+    // A wide checkpoint pays one extra vector: cheaper than one request that spans
+    // several engine pages and parks the whole checkpoint on admission.
     let mut assignments = Vec::with_capacity(items.len());
-    if !items.is_empty() {
-        assignments.extend(acquire(items)?);
+    for batch in items.chunks(SHARED_VERSION_BATCH_KEYS) {
+        assignments.extend(acquire(batch)?);
     }
     Ok(assignments)
 }
+
+/// Upper bound on the first-use shared objects initialised in one store request. An owner
+/// read carries at most 128 members and the table pages at 256 keys, so asking for a whole
+/// large checkpoint at once (204 transactions, up to 999 inputs each) would leave the
+/// greater part of the request waiting on admission. One chunk is one bounded page.
+const SHARED_VERSION_BATCH_KEYS: usize = 256;
 
 impl CheckpointExecutor {
     /// Load all data for a checkpoint, ensure all transactions are executed, and check for forks.

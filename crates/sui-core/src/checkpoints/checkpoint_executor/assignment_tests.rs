@@ -3,7 +3,7 @@
 
 use super::*;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use sui_types::error::SuiErrorKind;
 
 /// A store read failure while initialising shared versions must reach the caller as an
@@ -72,5 +72,48 @@ fn assignments_are_concatenated_in_input_order() {
         assignments,
         [10, 20, 30, 40],
         "assignments must be returned in input order"
+    );
+}
+
+/// A checkpoint that fits one bounded request must be initialised in exactly one call, so
+/// the usual path keeps its single allocation instead of copying the manager's vector.
+#[test]
+fn checkpoint_that_fits_one_request_is_initialised_once() {
+    let items: Vec<u16> = (0..SHARED_VERSION_BATCH_KEYS as u16).collect();
+    let calls = Cell::new(0);
+    let assignments = acquire_shared_versions(&items, |batch| {
+        calls.set(calls.get() + 1);
+        Ok(batch.to_vec())
+    })
+    .expect("a checkpoint that fits one request must initialise in one call");
+
+    assert_eq!(
+        calls.get(),
+        1,
+        "SHARED_VERSION_BATCH_KEYS objects fit one bounded request"
+    );
+    assert_eq!(assignments, items, "the assignments must keep input order");
+}
+
+/// A large checkpoint must not turn its first-use shared objects into one very wide store
+/// request. Chunking bounds each request and must not reorder the assignments.
+#[test]
+fn large_checkpoints_initialise_shared_versions_in_bounded_chunks() {
+    let items: Vec<u16> = (0..600).collect();
+    let chunk_sizes = RefCell::new(Vec::new());
+    let assignments = acquire_shared_versions(&items, |batch| {
+        chunk_sizes.borrow_mut().push(batch.len());
+        Ok(batch.to_vec())
+    })
+    .expect("chunked assignments must succeed");
+
+    assert_eq!(
+        *chunk_sizes.borrow(),
+        [SHARED_VERSION_BATCH_KEYS, SHARED_VERSION_BATCH_KEYS, 88],
+        "600 first-use objects must be initialised as 256 + 256 + 88"
+    );
+    assert_eq!(
+        assignments, items,
+        "chunking must preserve the input order of the assignments"
     );
 }
