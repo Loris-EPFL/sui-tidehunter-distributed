@@ -1262,7 +1262,14 @@ impl CheckpointStore {
             &contents,
         )?;
         batch.delete_batch(&self.tables.checkpoint_by_digest, &checkpoints)?;
-        let value = (checkpoint_number, CheckpointDigest::random());
+        // The digest half of the pruned watermark is informational, but it must stay
+        // deterministic: a random value makes the same pruning outcome read
+        // differently across restarts and defeats digest comparisons. Publish the
+        // last pruned digest, and the default when this batch pruned no digest.
+        let value = (
+            checkpoint_number,
+            checkpoints.last().copied().unwrap_or_default(),
+        );
         batch.insert_batch(
             &self.tables.watermarks,
             [(CheckpointWatermark::HighestPruned, value)],
@@ -4692,3 +4699,6 @@ mod tests {
         epoch_store.insert_executed_in_epoch(&digest);
     }
 }
+
+#[cfg(test)]
+mod pruning_tests;
