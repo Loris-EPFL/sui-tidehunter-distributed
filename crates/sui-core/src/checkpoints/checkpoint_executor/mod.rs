@@ -34,6 +34,7 @@ use sui_types::{
 use sui_config::node::{CheckpointExecutorConfig, RunWithRange};
 use sui_macros::fail_point;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
+use sui_types::error::{SuiError, SuiResult};
 use sui_types::executable_transaction::VerifiedExecutableTransaction;
 use sui_types::execution_status::{ExecutionErrorKind, ExecutionFailure, ExecutionStatus};
 use sui_types::full_checkpoint_content::Checkpoint;
@@ -282,8 +283,12 @@ impl CheckpointExecutor {
     /// Execute all checkpoints for the current epoch, ensuring that the node has not
     /// forked, and return when finished.
     /// If `run_with_range` is set, execution will stop early.
+    ///
+    /// A storage failure fails the epoch run and is returned to the caller; it is not
+    /// turned into a panic, because the executor cannot repair a store that returned a
+    /// malformed or unreadable value.
     #[instrument(level = "error", skip_all, fields(epoch = ?self.epoch_store.epoch()))]
-    pub async fn run_epoch(self, run_with_range: Option<RunWithRange>) -> StopReason {
+    pub async fn run_epoch(self, run_with_range: Option<RunWithRange>) -> SuiResult<StopReason> {
         let _metrics_scope = mysten_metrics::monitored_scope("CheckpointExecutor::run_epoch");
         info!(?run_with_range, "CheckpointExecutor::run_epoch");
         debug!(
@@ -296,7 +301,7 @@ impl CheckpointExecutor {
         // i.e Epoch(N) means we will execute epoch N and stop when reaching N+1
         if run_with_range.is_some_and(|rwr| rwr.is_epoch_gt(self.epoch_store.epoch())) {
             info!("RunWithRange condition satisfied at {:?}", run_with_range,);
-            return StopReason::RunWithRangeCondition;
+            return Ok(StopReason::RunWithRangeCondition);
         };
 
         self.metrics
@@ -304,7 +309,7 @@ impl CheckpointExecutor {
             .set(self.epoch_store.epoch() as i64);
 
         let Some(next_to_schedule) = self.get_next_to_schedule() else {
-            return StopReason::EpochComplete;
+            return Ok(StopReason::EpochComplete);
         };
 
         let this = Arc::new(self);
@@ -330,26 +335,47 @@ impl CheckpointExecutor {
                 let pipeline_handle = pipeline_handle.await;
                 tokio::spawn(this.execute_checkpoint(checkpoint, pipeline_handle, admitted_at))
                     .await
-                    .unwrap()
+                    // A panicking checkpoint task is an executor bug and must keep failing
+                    // loudly. A storage failure is an `Err` value that stays a value.
+                    .expect("checkpoint execution task panicked")
             }
         })
         .buffered(concurrency)
         // Take the last value from the stream to determine if we completed the epoch
-        .fold(false, |state, is_final_checkpoint| async move {
+        .fold(Ok::<bool, SuiError>(false), |state, result| async move {
+            let state: bool = state?;
+            let is_final_checkpoint: bool = result?;
             assert!(
                 !state,
                 "fold can't be called again after the final checkpoint"
             );
-            is_final_checkpoint
+            Ok(is_final_checkpoint)
         })
-        .await;
+        .await?;
 
         if final_checkpoint_executed {
-            StopReason::EpochComplete
+            Ok(StopReason::EpochComplete)
         } else {
-            StopReason::RunWithRangeCondition
+            Ok(StopReason::RunWithRangeCondition)
         }
     }
+}
+
+/// Initialises the shared versions of every first-use object in a checkpoint before any
+/// of its transactions is enqueued. Doing this once per checkpoint instead of once per
+/// transaction lets the version manager deduplicate keys and keep one initialisation lock
+/// per object. Assignments are returned in input order, which the caller verifies.
+///
+/// A storage failure is returned as an error rather than turned into a panic.
+fn acquire_shared_versions<T, A, F>(items: &[T], mut acquire: F) -> SuiResult<Vec<A>>
+where
+    F: FnMut(&[T]) -> SuiResult<Vec<A>>,
+{
+    let mut assignments = Vec::with_capacity(items.len());
+    if !items.is_empty() {
+        assignments.extend(acquire(items)?);
+    }
+    Ok(assignments)
 }
 
 impl CheckpointExecutor {
@@ -360,7 +386,7 @@ impl CheckpointExecutor {
         checkpoint: VerifiedCheckpoint,
         mut pipeline_handle: PipelineHandle,
         admitted_at: Instant,
-    ) -> bool /* is final checkpoint */ {
+    ) -> SuiResult<bool> /* is final checkpoint */ {
         info!("executing checkpoint");
         let sequence_number = checkpoint.sequence_number;
 
@@ -395,10 +421,10 @@ impl CheckpointExecutor {
             || checkpoint.is_last_checkpoint_of_epoch()
         {
             self.execute_transactions_from_synced_checkpoint(checkpoint, &mut pipeline_handle)
-                .await
+                .await?
         } else {
             self.verify_locally_built_checkpoint(checkpoint, &mut pipeline_handle)
-                .await
+                .await?
         };
 
         let tps = self.tps_estimator.lock().update(
@@ -532,7 +558,7 @@ impl CheckpointExecutor {
             .checkpoint_completion_latency
             .observe(admitted_at.elapsed().as_secs_f64());
 
-        ckpt_state.data.checkpoint.is_last_checkpoint_of_epoch()
+        Ok(ckpt_state.data.checkpoint.is_last_checkpoint_of_epoch())
     }
 
     // On validators, checkpoints have often already been constructed locally, in which
@@ -545,7 +571,7 @@ impl CheckpointExecutor {
         &self,
         checkpoint: VerifiedCheckpoint,
         pipeline_handle: &mut PipelineHandle,
-    ) -> CheckpointExecutionState {
+    ) -> SuiResult<CheckpointExecutionState> {
         assert!(
             !checkpoint.is_last_checkpoint_of_epoch(),
             "only fullnode path has end-of-epoch logic"
@@ -601,9 +627,9 @@ impl CheckpointExecutor {
             let (state, tx_data) =
                 self.load_checkpoint_transactions(checkpoint, Some(state_hasher));
 
-            return self
+            return Ok(self
                 .finalize_executed_checkpoint_transactions(state, &tx_data, pipeline_handle)
-                .await;
+                .await);
         }
 
         let checkpoint_contents = self
@@ -631,7 +657,10 @@ impl CheckpointExecutor {
             tx_digests,
             fx_digests,
         };
-        CheckpointExecutionState::new_with_global_state_hasher(ckpt_data, state_hasher)
+        Ok(CheckpointExecutionState::new_with_global_state_hasher(
+            ckpt_data,
+            state_hasher,
+        ))
     }
 
     #[instrument(level = "info", skip_all)]
@@ -639,12 +668,13 @@ impl CheckpointExecutor {
         &self,
         checkpoint: VerifiedCheckpoint,
         pipeline_handle: &mut PipelineHandle,
-    ) -> CheckpointExecutionState {
+    ) -> SuiResult<CheckpointExecutionState> {
         let (ckpt_state, tx_data, unexecuted_tx_digests) = {
             let _scope =
                 mysten_metrics::monitored_scope("CheckpointExecutor::execute_transactions");
             let (ckpt_state, tx_data) = self.load_checkpoint_transactions(checkpoint, None);
-            let unexecuted_tx_digests = self.schedule_transaction_execution(&ckpt_state, &tx_data);
+            let unexecuted_tx_digests =
+                self.schedule_transaction_execution(&ckpt_state, &tx_data)?;
             (ckpt_state, tx_data, unexecuted_tx_digests)
         };
 
@@ -666,8 +696,9 @@ impl CheckpointExecutor {
                 .await;
         }
 
-        self.finalize_executed_checkpoint_transactions(ckpt_state, &tx_data, pipeline_handle)
-            .await
+        Ok(self
+            .finalize_executed_checkpoint_transactions(ckpt_state, &tx_data, pipeline_handle)
+            .await)
     }
 
     async fn finalize_executed_checkpoint_transactions(
@@ -920,7 +951,7 @@ impl CheckpointExecutor {
         &self,
         ckpt_state: &CheckpointExecutionState,
         tx_data: &CheckpointTransactionData,
-    ) -> Vec<TransactionDigest> {
+    ) -> SuiResult<Vec<TransactionDigest>> {
         let mut barrier_deps_builder = BarrierDependencyBuilder::new();
 
         // Find unexecuted transactions and their expected effects digests
@@ -978,17 +1009,11 @@ impl CheckpointExecutor {
             .iter()
             .map(|(txn, effects, version, _, _)| (*txn, *effects, *version))
             .collect::<Vec<_>>();
-        let assigned_versions = if certs_and_effects.is_empty() {
-            Vec::new()
-        } else {
+        let assigned_versions = acquire_shared_versions(&certs_and_effects, |batch| {
             self.epoch_store
-                .acquire_shared_version_assignments_from_effects(
-                    &certs_and_effects,
-                    &*self.object_cache_reader,
-                )
-                .expect("failed to acquire shared version assignments")
-                .0
-        };
+                .acquire_shared_version_assignments_from_effects(batch, &*self.object_cache_reader)
+                .map(|assigned| assigned.0)
+        })?;
         let unexecuted_txns = unexecuted_txns
             .into_iter()
             .zip_debug_eq(assigned_versions)
@@ -1022,7 +1047,7 @@ impl CheckpointExecutor {
         self.execution_scheduler
             .enqueue_transactions(unexecuted_txns, &self.epoch_store);
 
-        unexecuted_tx_digests
+        Ok(unexecuted_tx_digests)
     }
 
     // Execute the change epoch txn
@@ -1245,3 +1270,6 @@ impl CheckpointExecutor {
         }
     }
 }
+
+#[cfg(test)]
+mod assignment_tests;

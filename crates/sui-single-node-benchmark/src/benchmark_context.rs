@@ -436,7 +436,8 @@ impl BenchmarkContext {
         info!("Starting checkpoint execution. You can now attach a profiler");
         checkpoint_executor
             .run_epoch(Some(RunWithRange::Checkpoint(last_checkpoint_seq)))
-            .await;
+            .await
+            .expect("checkpoint execution failed");
         let elapsed = start_time.elapsed().as_millis() as f64 / 1000f64;
         info!(
             "Checkpoint execution finished in {}s, TPS={}.",
