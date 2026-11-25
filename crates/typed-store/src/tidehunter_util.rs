@@ -184,13 +184,17 @@ fn open_backend(
             database.remote.clone().with_native_index(&native)
         };
         // One measurement row must configure both measured nodes identically. The native
-        // arm reads `TH_INDEX_BLOB_CACHE_BYTES` in `thdb_config`, and a document without
-        // an `index` section inherits it through `with_native_index`; a document that
-        // states the section is overridden here, because the row must not depend on
-        // which document an arm runs.
+        // arm reads `TH_INDEX_BLOB_CACHE_BYTES` and `TH_INDEX_BLOB_CACHE_MIN_BYTES` in
+        // `thdb_config`, and a document without an `index` section inherits both through
+        // `with_native_index`; a document that states the section is overridden here,
+        // because the rows must not depend on which document an arm runs. The engine's
+        // `validate` then applies the floor-versus-budget rule to the resolved pair.
         let mut remote = remote;
         if let Some(bytes) = index_blob_cache_bytes() {
             remote.index.index_blob_cache_bytes = Some(bytes);
+        }
+        if let Some(min_bytes) = index_blob_cache_min_bytes() {
+            remote.index.index_blob_cache_min_bytes = min_bytes;
         }
         if let Some(reason) = remote_durability_mismatch(
             remote.live_nvme.leased_durability,
@@ -701,6 +705,44 @@ fn parse_index_blob_cache_bytes(raw: Option<&str>) -> Option<usize> {
     Some(parsed)
 }
 
+/// `TH_INDEX_BLOB_CACHE_MIN_BYTES` is the admission floor of the index blob cache: a
+/// syscall-path blob is cached only if its frame payload reaches this many bytes.
+/// Unset leaves the engine default (64 MiB, [`tidehunter::config::Config::default`]);
+/// zero is valid there and admits every blob that fits the budget, which is what a
+/// small replay needs. Like the budget row, the native database reads it in
+/// [`thdb_config`] and the sharded-wal coordinator's hybrid index reads it in
+/// [`open_backend`], so both measured nodes get the same floor.
+fn index_blob_cache_min_bytes() -> Option<usize> {
+    let raw = env::var("TH_INDEX_BLOB_CACHE_MIN_BYTES").ok();
+    parse_index_blob_cache_min_bytes(raw.as_deref())
+}
+
+/// The pure half of [`index_blob_cache_min_bytes`]; zero is accepted because the
+/// engine's `validate` accepts it.
+fn parse_index_blob_cache_min_bytes(raw: Option<&str>) -> Option<usize> {
+    let raw = raw?;
+    let parsed = raw.parse::<usize>().unwrap_or_else(|_| {
+        panic!("Failed to parse TH_INDEX_BLOB_CACHE_MIN_BYTES as a byte count: {raw:?}")
+    });
+    println!("Using TH_INDEX_BLOB_CACHE_MIN_BYTES from env variable {parsed}");
+    Some(parsed)
+}
+
+/// The engine's `validate` rule for the pair, applied to the two `TH_*` rows: a floor
+/// above the budget would reject every blob that qualified for admission. Native
+/// asserts it and the hybrid coordinator returns the same text as an invalid config, so
+/// a misconfigured arm names both rows here instead of failing later at open.
+fn check_index_blob_cache_pair(cache: Option<usize>, min: Option<usize>) {
+    if let (Some(cache_bytes), Some(min_bytes)) = (cache, min) {
+        assert!(
+            min_bytes <= cache_bytes,
+            "TH_INDEX_BLOB_CACHE_MIN_BYTES {min_bytes} exceeds TH_INDEX_BLOB_CACHE_BYTES \
+             {cache_bytes}: every blob that qualified for admission would be rejected as \
+             oversized"
+        );
+    }
+}
+
 /// Sui's resolved native index rows. The native backend hands them to
 /// `Db::open`; the sharded-wal backend hands them to the coordinator hybrid
 /// through [`tidehunter::distributed::remote_db::RemoteDatabaseConfig::with_native_index`].
@@ -749,6 +791,9 @@ fn thdb_config(metric_conf: &MetricConf) -> Config {
     let compressed_batch_cache_bytes = metric_conf
         .enable_th_batch_compression
         .then_some(4 * 1024 * 1024 * 1024);
+    let blob_cache_bytes = index_blob_cache_bytes();
+    let blob_cache_min_bytes = index_blob_cache_min_bytes();
+    check_index_blob_cache_pair(blob_cache_bytes, blob_cache_min_bytes);
     let mut config = Config {
         frag_size,
         // run snapshot every 8 Gb written to wal
@@ -766,9 +811,12 @@ fn thdb_config(metric_conf: &MetricConf) -> Config {
         batch_codec,
         compressed_batch_cache_bytes,
         relocation_max_reclaim_pct: 100,
-        index_blob_cache_bytes: index_blob_cache_bytes(),
+        index_blob_cache_bytes: blob_cache_bytes,
         ..Config::default()
     };
+    if let Some(min_bytes) = blob_cache_min_bytes {
+        config.index_blob_cache_min_bytes = min_bytes;
+    }
 
     apply_auto_sharding(&mut config, parse_env_bool("TH_AUTOSHARD"));
 
