@@ -167,21 +167,6 @@ pub trait ExecutionCacheCommit: Send + Sync {
         checkpoint: CheckpointSequenceNumber,
     );
 
-    /// Stage the digest-to-checkpoint mapping of a fullnode's finalized transactions into
-    /// `batch`, so the mapping is written atomically with the transaction outputs that make
-    /// it meaningful. Called by CheckpointExecutor between [`Self::build_db_batch`] and
-    /// [`Self::commit_transaction_outputs`]. This is the deprecated perpetual table that
-    /// read RPC still consults; writing it in the outputs batch removes a second durable
-    /// write per checkpoint and leaves no window in which outputs are durable but the
-    /// mapping is not.
-    fn set_finalized_transactions_in_batch(
-        &self,
-        batch: &mut Batch,
-        digests: &[TransactionDigest],
-        epoch: EpochId,
-        checkpoint: CheckpointSequenceNumber,
-    ) -> SuiResult;
-
     /// Durably commit the outputs of the given transactions to the database.
     /// Will be called by CheckpointExecutor to ensure that transaction outputs are
     /// written durably before marking a checkpoint as finalized.
@@ -651,6 +636,13 @@ pub trait CheckpointCache: Send + Sync {
         &self,
         digests: &[TransactionDigest],
     ) -> Vec<Option<(EpochId, CheckpointSequenceNumber)>>;
+
+    fn deprecated_insert_finalized_transactions(
+        &self,
+        digests: &[TransactionDigest],
+        epoch: EpochId,
+        sequence: CheckpointSequenceNumber,
+    );
 }
 
 pub trait ExecutionCacheReconfigAPI: Send + Sync {
@@ -839,6 +831,17 @@ macro_rules! implement_passthrough_traits {
                 self.store
                     .deprecated_multi_get_transaction_checkpoint(digests)
                     .expect("db error")
+            }
+
+            fn deprecated_insert_finalized_transactions(
+                &self,
+                digests: &[TransactionDigest],
+                epoch: EpochId,
+                sequence: CheckpointSequenceNumber,
+            ) {
+                self.store
+                    .deprecated_insert_finalized_transactions(digests, epoch, sequence)
+                    .expect("db error");
             }
         }
 

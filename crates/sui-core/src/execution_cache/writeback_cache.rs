@@ -1537,17 +1537,6 @@ impl ExecutionCacheCommit for WritebackCache {
             .expect("db error");
     }
 
-    fn set_finalized_transactions_in_batch(
-        &self,
-        batch: &mut Batch,
-        digests: &[TransactionDigest],
-        epoch: EpochId,
-        checkpoint: CheckpointSequenceNumber,
-    ) -> SuiResult {
-        self.store
-            .set_finalized_transactions_in_batch(&mut batch.1, digests, epoch, checkpoint)
-    }
-
     fn commit_transaction_outputs(
         &self,
         epoch: EpochId,
