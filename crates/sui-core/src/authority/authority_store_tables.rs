@@ -219,7 +219,7 @@ impl AuthorityPerpetualTables {
         use typed_store::tidehunter_util::{
             Bytes, Decision, KeyIndexing, KeySpaceConfig, KeyType, ThConfig,
             default_cells_per_mutex, default_max_dirty_keys, default_mutex_count,
-            default_value_cache_size, value_cache_size_override,
+            default_value_cache_size,
         };
         let mutexes = default_mutex_count() * 2;
         let transaction_mutexes = mutexes * 4;
@@ -251,12 +251,6 @@ impl AuthorityPerpetualTables {
         let epoch_tx_digest_prefix_key =
             KeyType::from_prefix_bits((8/*EpochId*/ + 8/*TransactionDigest prefix*/) * 8 + 12);
         let object_indexing = KeyIndexing::fixed(32 + 8); //  KeyIndexing::key_reduction(32 + 8, 16..(32 + 8));
-        // Transactions, effects and executed-effects are keyed by reduced digests spread
-        // over the whole uniform key space (~8K cells), so a per-cell cache of 1,000
-        // reserves ~15 GB for tables whose per-cell working set is a handful of keys. 256
-        // leaves a whole checkpoint batch of headroom per cell at a quarter of the
-        // reservation; TH_VALUE_CACHE_SIZE still overrides every keyspace.
-        let digest_value_cache_size = value_cache_size_override(256);
         let mut objects_config = KeySpaceConfig::new()
             .with_max_dirty_keys(16 * default_max_dirty_keys())
             .with_value_cache_size(value_cache_size);
@@ -281,7 +275,7 @@ impl AuthorityPerpetualTables {
                     transaction_mutexes,
                     uniform_key,
                     KeySpaceConfig::new()
-                        .with_value_cache_size(digest_value_cache_size)
+                        .with_value_cache_size(value_cache_size)
                         .with_relocation_filter(|_, _| Decision::Remove),
                     digest_prefix.clone(),
                 ),
@@ -293,9 +287,7 @@ impl AuthorityPerpetualTables {
                     transaction_mutexes,
                     uniform_key,
                     apply_relocation_filter(
-                        bloom_config
-                            .clone()
-                            .with_value_cache_size(digest_value_cache_size),
+                        bloom_config.clone().with_value_cache_size(value_cache_size),
                         pruner_watermark.clone(),
                         |effects: TransactionEffects| effects.executed_epoch(),
                         false,
@@ -311,7 +303,7 @@ impl AuthorityPerpetualTables {
                     uniform_key,
                     bloom_config
                         .clone()
-                        .with_value_cache_size(digest_value_cache_size)
+                        .with_value_cache_size(value_cache_size)
                         .with_relocation_filter(|_, _| Decision::Remove),
                     digest_prefix.clone(),
                 ),

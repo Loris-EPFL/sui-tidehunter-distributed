@@ -277,14 +277,8 @@ impl CheckpointStoreTables {
         let configs = vec![
             (
                 "checkpoint_content",
-                // Contents have no cache today, which costs a remote read for every
-                // executor load and every RPC index pass. They are written once and read
-                // twice soon after, so a small per-cell cache covers the reuse; the key is
-                // a uniform digest, so a large per-cell size would reserve hundreds of MB.
                 digest_config.clone().with_config(
-                    KeySpaceConfig::new()
-                        .with_value_cache_size(value_cache_size_override(16))
-                        .with_relocation_filter(|_, _| Decision::Remove),
+                    KeySpaceConfig::new().with_relocation_filter(|_, _| Decision::Remove),
                 ),
             ),
             (
