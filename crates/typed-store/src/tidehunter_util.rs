@@ -113,6 +113,32 @@ fn sharded_config() -> Option<ShardedWalConfig> {
     })
 }
 
+/// The remote route takes its write-acknowledgement tier from
+/// `SUI_SHARDED_WAL_CONFIG`, so a `TH_SYNC_WRITES` value naming another tier
+/// would measure an arm the operator did not select. Absent keeps the
+/// document's tier; a disagreement names both tiers and fails the open.
+#[cfg(feature = "sharded-wal")]
+fn remote_durability_mismatch(
+    configured: tidehunter::distributed::durability::DurabilityTier,
+    sync_writes: Option<bool>,
+) -> Option<String> {
+    let sync_writes = sync_writes?;
+    let requested = if sync_writes {
+        tidehunter::distributed::durability::DurabilityTier::Synchronous
+    } else {
+        tidehunter::distributed::durability::DurabilityTier::Native
+    };
+    if configured == requested {
+        return None;
+    }
+    Some(format!(
+        "TH_SYNC_WRITES={sync_writes} requires live_nvme.leased_durability \"{}\" in \
+         SUI_SHARDED_WAL_CONFIG, but the document sets \"{}\"",
+        requested.as_str(),
+        configured.as_str()
+    ))
+}
+
 fn configured_root() -> Option<std::path::PathBuf> {
     #[cfg(feature = "sharded-wal")]
     if let Some(config) = sharded_config() {
@@ -157,6 +183,12 @@ fn open_backend(
             let native = thdb_config(metric_conf);
             database.remote.clone().with_native_index(&native)
         };
+        if let Some(reason) = remote_durability_mismatch(
+            remote.live_nvme.leased_durability,
+            parse_env_bool("TH_SYNC_WRITES"),
+        ) {
+            panic!("{reason}");
+        }
         Db::open_remote_with_metrics(path, shape, remote, metrics)
             .expect("open sharded-wal Sui database")
     }
@@ -701,11 +733,23 @@ fn thdb_config(metric_conf: &MetricConf) -> Config {
         ..Config::default()
     };
 
-    if parse_env_bool("TH_AUTOSHARD").unwrap_or(false) {
-        config.with_index_auto_sharding();
-    }
+    apply_auto_sharding(&mut config, parse_env_bool("TH_AUTOSHARD"));
 
     config
+}
+
+/// `TH_AUTOSHARD` selects the index auto-sharding mode. Absent keeps the
+/// default `frag_size / 2` threshold, `true` restores it explicitly, and
+/// `false` disables auto-sharding for the campaign arms that compare the two
+/// layouts. A sharded-wal document without an `index` section takes these
+/// native rows through `RemoteDatabaseConfig::with_native_index`; a document
+/// that states the section keeps the operator's value.
+fn apply_auto_sharding(config: &mut Config, autoshard: Option<bool>) {
+    match autoshard {
+        Some(true) => config.with_index_auto_sharding(),
+        Some(false) => config.disable_index_auto_sharding(),
+        None => {}
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -718,8 +762,19 @@ pub fn default_mutex_count() -> usize {
     parse_env_usize("TH_DEFAULT_MUTEX_COUNT", 1).unwrap_or(16)
 }
 
+/// Sui's per-keyspace value cache entries: a campaign-wide `TH_VALUE_CACHE_SIZE`
+/// override first, then the `TH_DEFAULT_VALUE_CACHE_SIZE` default of 1000. Zero
+/// disables the cache. Both the native per-cell cache and the sharded-wal
+/// coordinator's per-cell cache read this size from the keyspace shape.
 pub fn default_value_cache_size() -> usize {
-    parse_env_usize("TH_DEFAULT_VALUE_CACHE_SIZE", 1).unwrap_or(1000)
+    value_cache_size_override(parse_env_usize("TH_DEFAULT_VALUE_CACHE_SIZE", 1).unwrap_or(1000))
+}
+
+/// The campaign override for a keyspace whose cache size Sui sets explicitly
+/// instead of taking [`default_value_cache_size`]: `TH_VALUE_CACHE_SIZE`
+/// replaces the requested size, and zero disables the cache.
+pub fn value_cache_size_override(requested: usize) -> usize {
+    parse_env_usize("TH_VALUE_CACHE_SIZE", 0).unwrap_or(requested)
 }
 
 pub(crate) fn apply_range_bounds(
@@ -937,5 +992,59 @@ mod adapter_metrics_tests {
         let stopped = prometheus::core::Collector::collect(&collector);
         assert_eq!(stat_value(&stopped, "local_sample_available"), Some(0.0));
         assert_eq!(stat_value(&stopped, "local_sampler_stopped"), Some(1.0));
+    }
+}
+
+#[cfg(test)]
+mod campaign_config_tests {
+    use super::*;
+
+    #[test]
+    fn auto_sharding_off_disables_the_threshold() {
+        let mut config = Config::default();
+        let default_threshold = config.auto_shard_threshold();
+        apply_auto_sharding(&mut config, Some(false));
+        assert_eq!(
+            config.auto_shard_threshold(),
+            usize::MAX,
+            "TH_AUTOSHARD=false must disable auto-sharding; the enabled threshold was {default_threshold}"
+        );
+        apply_auto_sharding(&mut config, Some(true));
+        assert_eq!(
+            config.auto_shard_threshold(),
+            default_threshold,
+            "TH_AUTOSHARD=true must restore the default threshold"
+        );
+        apply_auto_sharding(&mut config, None);
+        assert_eq!(
+            config.auto_shard_threshold(),
+            default_threshold,
+            "an absent TH_AUTOSHARD must keep the default threshold"
+        );
+    }
+
+    #[cfg(feature = "sharded-wal")]
+    #[test]
+    fn remote_tier_check_rejects_a_sync_writes_disagreement() {
+        use tidehunter::distributed::durability::DurabilityTier;
+
+        let mismatch = remote_durability_mismatch(DurabilityTier::Synchronous, Some(false))
+            .expect("a false TH_SYNC_WRITES against the synchronous tier must fail");
+        assert!(
+            mismatch.contains("TH_SYNC_WRITES=false") && mismatch.contains("synchronous"),
+            "the error must name the requested and configured tiers: {mismatch}"
+        );
+        assert!(
+            remote_durability_mismatch(DurabilityTier::Native, Some(false)).is_none(),
+            "a native document with TH_SYNC_WRITES=false must open"
+        );
+        assert!(
+            remote_durability_mismatch(DurabilityTier::Synchronous, Some(true)).is_none(),
+            "a synchronous document with TH_SYNC_WRITES=true must open"
+        );
+        assert!(
+            remote_durability_mismatch(DurabilityTier::Synchronous, None).is_none(),
+            "an absent TH_SYNC_WRITES must keep the document tier"
+        );
     }
 }
