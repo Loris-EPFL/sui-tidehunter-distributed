@@ -426,23 +426,19 @@ impl AuthorityStore {
         }
     }
 
-    // DEPRECATED -- use function of same name in AuthorityPerEpochStore
-    pub fn deprecated_insert_finalized_transactions(
+    // DEPRECATED -- superseded by AuthorityPerEpochStore, but fullnodes keep the table for
+    // read RPC, so CheckpointExecutor stages these rows into the checkpoint's outputs batch.
+    pub fn set_finalized_transactions_in_batch(
         &self,
+        batch: &mut DBBatch,
         digests: &[TransactionDigest],
         epoch: EpochId,
         sequence: CheckpointSequenceNumber,
     ) -> SuiResult {
-        let mut batch = self
-            .perpetual_tables
-            .executed_transactions_to_checkpoint
-            .batch();
         batch.insert_batch(
             &self.perpetual_tables.executed_transactions_to_checkpoint,
             digests.iter().map(|d| (*d, (epoch, sequence))),
         )?;
-        batch.write()?;
-        trace!("Transactions {digests:?} finalized at checkpoint {sequence} epoch {epoch}");
         Ok(())
     }
 
@@ -1487,3 +1483,6 @@ pub struct LockDetailsV1Deprecated {
 
 #[cfg(test)]
 pub type LockDetailsDeprecated = LockDetailsV1Deprecated;
+
+#[cfg(test)]
+mod finalized_transactions_tests;

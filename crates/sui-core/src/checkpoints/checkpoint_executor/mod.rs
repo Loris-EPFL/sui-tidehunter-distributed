@@ -471,6 +471,22 @@ impl CheckpointExecutor {
             .get_cache_commit()
             .set_highest_committed_checkpoint_in_batch(&mut batch, seq);
 
+        // The deprecated digest-to-checkpoint mapping used to be a second durable write
+        // after this batch. Stage it here instead: the rows depend only on the digests
+        // already in the batch, so they land atomically with the outputs they describe,
+        // and one checkpoint costs one write batch instead of two. Only fullnodes keep
+        // that table; the epoch store's mapping is still written separately.
+        if self.state.is_fullnode(&self.epoch_store) {
+            self.state
+                .get_cache_commit()
+                .set_finalized_transactions_in_batch(
+                    &mut batch,
+                    &ckpt_state.data.tx_digests,
+                    self.epoch_store.epoch(),
+                    seq,
+                )?;
+        }
+
         finish_stage!(pipeline_handle, BuildDbBatch);
 
         // commit_accumulator_versions can only be called after the checkpoint is fully executed.
@@ -792,6 +808,9 @@ impl CheckpointExecutor {
             || self.config.data_ingestion_dir.is_some()
     }
 
+    /// Writes the epoch store's digest-to-checkpoint mapping and notifies its readers. The
+    /// deprecated perpetual mapping is staged into the checkpoint's outputs batch instead,
+    /// so it is durable at this point already.
     fn insert_finalized_transactions(
         &self,
         tx_digests: &[TransactionDigest],
@@ -800,17 +819,6 @@ impl CheckpointExecutor {
         self.epoch_store
             .insert_finalized_transactions(tx_digests, sequence_number)
             .expect("failed to insert finalized transactions");
-
-        if self.state.is_fullnode(&self.epoch_store) {
-            // TODO remove once we no longer need to support this table for read RPC
-            self.state
-                .get_checkpoint_cache()
-                .deprecated_insert_finalized_transactions(
-                    tx_digests,
-                    self.epoch_store.epoch(),
-                    sequence_number,
-                );
-        }
     }
 
     #[instrument(level = "info", skip_all)]
